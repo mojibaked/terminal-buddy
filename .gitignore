@@ -1,0 +1,26 @@
+build/
+build-*/
+out/
+
+# Secrets
+.env/dev.env
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+
+# Build artifacts
+*.obj
+*.pdb
+*.ilk
+*.exe
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# CMake
+CMakeUserPresets.json
+
+# Logs
+logs/
