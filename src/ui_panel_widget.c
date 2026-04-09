@@ -72,12 +72,33 @@ void tb_ui_build_expanded_shell(const TbUiModel *model) {
         .lineHeight = tb_ui_scale_u16(model, 15),
         .textColor = {255, 255, 255, 164}
     });
+    Clay_TextElementConfig metrics_text = CLAY_TEXT_CONFIG({
+        .fontId = TB_UI_FONT_ID_BODY,
+        .fontSize = tb_ui_scale_u16(model, 10),
+        .lineHeight = tb_ui_scale_u16(model, 13),
+        .textColor = {255, 255, 255, 120}
+    });
+    Clay_TextElementConfig action_text = CLAY_TEXT_CONFIG({
+        .fontId = TB_UI_FONT_ID_BODY,
+        .fontSize = tb_ui_scale_u16(model, 12),
+        .textColor = {255, 255, 255, 240}
+    });
     const char *title = model->status_text != NULL ? model->status_text : "TRANSCRIPT";
+    const char *processing_subtitle = "transcribing";
 
     if (model->scene == TB_UI_SCENE_LISTENING) {
         title = "LISTENING";
     } else if (model->scene == TB_UI_SCENE_PROCESSING) {
         title = "TRANSCRIBING";
+        if (model->backend_label != NULL && SDL_strcasecmp(model->backend_label, "NPU") == 0) {
+            processing_subtitle = "running locally on NPU";
+        } else if (model->backend_label != NULL && SDL_strcasecmp(model->backend_label, "OpenAI") == 0) {
+            processing_subtitle = "sending clip to OpenAI";
+        } else if (model->backend_label != NULL && model->backend_label[0] != '\0') {
+            static char dynamic_subtitle[64];
+            SDL_snprintf(dynamic_subtitle, sizeof(dynamic_subtitle), "transcribing with %s", model->backend_label);
+            processing_subtitle = dynamic_subtitle;
+        }
     }
 
     CLAY(CLAY_ID("Shell"), {
@@ -118,36 +139,84 @@ void tb_ui_build_expanded_shell(const TbUiModel *model) {
                 .childGap = tb_ui_scale_u16(model, 8)
             }
         }) {
-            CLAY(CLAY_ID("ShellTitleRow"), {
-                .layout = {
-                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(tb_ui_scale_value(model, 16)) },
-                    .childGap = tb_ui_scale_u16(model, 8)
+            if (model->primary_action_label != NULL && model->primary_action_label[0] != '\0') {
+                CLAY(CLAY_ID("PrimaryActionOnlyContent"), {
+                    .layout = {
+                        .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                    }
+                }) {
+                    CLAY(CLAY_ID("FeedbackPrimaryAction"), {
+                        .layout = {
+                            .sizing = { CLAY_SIZING_FIXED(tb_ui_scale_value(model, 176)), CLAY_SIZING_FIXED(tb_ui_scale_value(model, 56)) },
+                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                        },
+                        .backgroundColor = tb_ui_color(82, 155, 255, 232),
+                        .cornerRadius = CLAY_CORNER_RADIUS(tb_ui_scale_value(model, 16)),
+                        .border = {
+                            .color = tb_ui_color(255, 255, 255, 52),
+                            .width = {1, 1, 1, 1}
+                        }
+                    }) {
+                        CLAY_TEXT(tb_ui_string(model->primary_action_label), action_text);
+                    }
                 }
-            }) {
-                CLAY_TEXT(tb_ui_string(title), title_text);
-                if (model->scene == TB_UI_SCENE_LISTENING && model->mode_label != NULL) {
-                    CLAY_TEXT(tb_ui_string(model->mode_label), subtitle_text);
+            } else if (model->scene == TB_UI_SCENE_LISTENING) {
+                CLAY(CLAY_ID("ShellTitleRow"), {
+                    .layout = {
+                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(tb_ui_scale_value(model, 16)) },
+                        .childGap = tb_ui_scale_u16(model, 8)
+                    }
+                }) {
+                    CLAY_TEXT(tb_ui_string(title), title_text);
+                    if (model->mode_label != NULL) {
+                        CLAY_TEXT(tb_ui_string(model->mode_label), subtitle_text);
+                    }
                 }
-            }
 
-            if (model->scene == TB_UI_SCENE_LISTENING) {
                 tb_ui_build_listening_bars(model);
                 CLAY_TEXT(tb_ui_string("tap again to stop"), subtitle_text);
             } else if (model->scene == TB_UI_SCENE_PROCESSING) {
+                CLAY(CLAY_ID("ShellTitleRow"), {
+                    .layout = {
+                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(tb_ui_scale_value(model, 16)) },
+                        .childGap = tb_ui_scale_u16(model, 8)
+                    }
+                }) {
+                    CLAY_TEXT(tb_ui_string(title), title_text);
+                }
+
                 tb_ui_build_processing_bars(model);
-                CLAY_TEXT(tb_ui_string("sending clip to OpenAI"), subtitle_text);
+                CLAY_TEXT(tb_ui_string(processing_subtitle), subtitle_text);
             } else {
+                CLAY(CLAY_ID("ShellTitleRow"), {
+                    .layout = {
+                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(tb_ui_scale_value(model, 16)) },
+                        .childGap = tb_ui_scale_u16(model, 8)
+                    }
+                }) {
+                    CLAY_TEXT(tb_ui_string(title), title_text);
+                }
+
                 CLAY(CLAY_ID("TranscriptBlock"), {
                     .layout = {
                         .layoutDirection = CLAY_TOP_TO_BOTTOM,
-                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) }
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+                        .childGap = tb_ui_scale_u16(model, 6)
                     }
                 }) {
                     if (model->transcript_text != NULL && model->transcript_text[0] != '\0') {
                         CLAY_TEXT(tb_ui_string(model->transcript_text), transcript_text);
                     } else {
                         CLAY_TEXT(tb_ui_string("No transcript text returned."), transcript_text);
+                    }
+
+                    if (model->metrics_text != NULL && model->metrics_text[0] != '\0') {
+                        CLAY_TEXT(tb_ui_string(model->metrics_text), metrics_text);
                     }
                 }
             }

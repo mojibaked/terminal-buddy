@@ -10,7 +10,7 @@
 #define TB_UI_BUTTON_SIZE 76
 #define TB_UI_BUTTON_GLOW_SIZE 84
 #define TB_UI_SHELL_WIDTH 348
-#define TB_UI_SHELL_HEIGHT 100
+#define TB_UI_SHELL_HEIGHT 112
 #define TB_UI_SHELL_RADIUS 50
 
 typedef struct TbUiColors {
@@ -102,7 +102,6 @@ static inline Clay_Color tb_ui_active_glow(void) {
 
 void tb_ui_build_button(const TbUiModel *model, bool active);
 void tb_ui_build_expanded_shell(const TbUiModel *model);
-void tb_ui_build_keyboard_shell(const TbUiModel *model);
 void tb_ui_build_idle_shell(const TbUiModel *model);
 void tb_ui_build_layout(const TbUiModel *model);
 

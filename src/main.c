@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,15 +9,13 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <winhttp.h>
 #endif
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
+#include <SDL3/SDL_system.h>
 
-#include "keyboard_emit_win32.h"
-#include "keyboard_layout.h"
-#include "keyboard_state.h"
+#include "transcription_backend.h"
 #include "ui_clay.h"
 
 #ifndef TERMINAL_BUDDY_SOURCE_DIR
@@ -25,8 +24,7 @@
 
 #define IDLE_WINDOW_SIZE 96
 #define EXPANDED_WINDOW_WIDTH 360
-#define EXPANDED_WINDOW_HEIGHT 120
-#define KEYBOARD_LONG_PRESS_MS 325u
+#define EXPANDED_WINDOW_HEIGHT 132
 #define BUTTON_DIAMETER 76.0f
 #define BUTTON_MARGIN 10.0f
 #define DRAG_THRESHOLD 10.0f
@@ -36,8 +34,13 @@
 #define AUDIO_LEVEL_DECAY 0.88f
 #define MAX_STATUS_TEXT 256
 #define MAX_TRANSCRIPT_TEXT 2048
-#define MAX_MODEL_NAME 64
-#define MAX_API_KEY 512
+#define MAX_METRICS_TEXT 256
+
+#ifdef _WIN32
+#define TB_GLOBAL_HOTKEY_ID 0x5442
+#define TB_GLOBAL_HOTKEY_MODIFIERS (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT)
+#define TB_GLOBAL_HOTKEY_VKEY VK_SPACE
+#endif
 
 typedef enum PointerKind {
     POINTER_NONE = 0,
@@ -47,9 +50,13 @@ typedef enum PointerKind {
 
 typedef enum AppMode {
     APP_MODE_STANDARD = 0,
-    APP_MODE_CODING,
     APP_MODE_TERMINAL
 } AppMode;
+
+typedef enum ControlMode {
+    CONTROL_MODE_WIDGET = 0,
+    CONTROL_MODE_HOTKEY
+} ControlMode;
 
 typedef struct ModePalette {
     Uint8 r;
@@ -66,32 +73,46 @@ typedef struct DragState {
     bool pressed;
     bool dragging;
     bool pending_toggle;
-    bool long_press_fired;
     float start_global_x;
     float start_global_y;
     int window_start_x;
     int window_start_y;
-    Uint64 pressed_at_ms;
 } DragState;
 
-typedef struct KeyboardPressState {
-    PointerKind kind;
-    SDL_FingerID finger_id;
-    bool pressed;
-    bool armed;
-    int key_index;
-    Uint64 next_repeat_ms;
-} KeyboardPressState;
+typedef struct DragPerfTrace {
+    bool active;
+    Uint64 started_counter;
+    Uint64 render_total_counter;
+    Uint64 render_max_counter;
+    uint32_t pointer_update_count;
+    uint32_t window_move_count;
+    uint32_t redraw_request_count;
+    uint32_t render_count;
+    uint32_t window_exposed_count;
+} DragPerfTrace;
 
 typedef struct TrayState {
     SDL_Tray *tray;
     SDL_TrayMenu *menu;
+    SDL_TrayMenu *control_menu;
+    SDL_TrayMenu *backend_menu;
+    SDL_TrayMenu *npu_model_menu;
     SDL_TrayMenu *mode_menu;
     SDL_TrayMenu *text_menu;
     SDL_TrayEntry *show_hide;
+    SDL_TrayEntry *control_parent;
+    SDL_TrayEntry *control_widget;
+    SDL_TrayEntry *control_hotkey;
+    SDL_TrayEntry *backend_parent;
+    SDL_TrayEntry *backend_openai;
+    SDL_TrayEntry *backend_npu;
+    SDL_TrayEntry *npu_model_parent;
+    SDL_TrayEntry *npu_model_tiny;
+    SDL_TrayEntry *npu_model_base;
+    SDL_TrayEntry *npu_model_small;
+    SDL_TrayEntry *npu_model_turbo;
     SDL_TrayEntry *mode_parent;
     SDL_TrayEntry *mode_standard;
-    SDL_TrayEntry *mode_coding;
     SDL_TrayEntry *mode_terminal;
     SDL_TrayEntry *text_parent;
     SDL_TrayEntry *text_surface;
@@ -118,12 +139,12 @@ typedef struct TranscriptionState {
     bool worker_done;
     bool show_feedback;
     bool clipboard_dirty;
-    bool api_ready;
+    bool terminal_submit_ready;
     char *env_path;
-    char api_key[MAX_API_KEY];
-    char model[MAX_MODEL_NAME];
+    TbTranscriptionConfig config;
     char status_text[MAX_STATUS_TEXT];
     char transcript_text[MAX_TRANSCRIPT_TEXT];
+    char metrics_text[MAX_METRICS_TEXT];
 } TranscriptionState;
 
 typedef struct WindowMetrics {
@@ -142,22 +163,24 @@ typedef struct AppState {
     bool running;
     bool listening;
     bool visible;
+    bool widget_visible;
     bool needs_redraw;
-    bool keyboard_visible;
+    bool perf_logging_enabled;
     bool text_debug_logging;
+    bool hotkey_registered;
     int window_x;
     int window_y;
     AppMode mode;
+    ControlMode control_mode;
     TbUiTextRenderMode text_render_mode;
     Uint64 last_render_ms;
+    Uint64 perf_counter_freq;
+    Uint32 hotkey_event_type;
     char *prefs_path;
     SDL_Window *window;
     SDL_Renderer *renderer;
     DragState drag;
-    KeyboardPressState keyboard_press;
-    TbKeyboardModState keyboard_mods;
-    TbKeyboardLayoutResult keyboard_layout;
-    char keyboard_labels[TB_KEYBOARD_MAX_KEYS][8];
+    DragPerfTrace drag_perf;
     WindowMetrics window_metrics;
     TrayState tray;
     AudioState audio;
@@ -174,8 +197,7 @@ typedef struct TranscriptionJob {
     float *samples;
     int sample_count;
     AppMode mode;
-    char *api_key;
-    char *model;
+    TbTranscriptionConfig config;
 } TranscriptionJob;
 
 static SDL_LogOutputFunction g_default_log_output;
@@ -184,6 +206,17 @@ static SDL_Mutex *g_log_mutex = NULL;
 static FILE *g_log_file = NULL;
 static bool g_log_capture_enabled = false;
 static char *g_log_path = NULL;
+static FILE *g_perf_log_file = NULL;
+static char *g_perf_log_path = NULL;
+
+static void perf_log_message(const AppState *state, const char *fmt, ...);
+static void handle_panel_tap(AppState *state);
+static bool update_hotkey_registration(AppState *state);
+static void apply_window_visibility_policy(AppState *state);
+static bool try_submit_terminal_target(AppState *state);
+static void clamp_window_to_display(AppState *state);
+static bool ui_is_processing(AppState *state);
+static void refresh_shell_state(AppState *state);
 
 static int fail(const char *message) {
     SDL_Log("%s: %s", message, SDL_GetError());
@@ -205,20 +238,10 @@ static float button_center_y(const AppState *state, bool listening) {
     return ((float) IDLE_WINDOW_SIZE * 0.5f) * state->window_metrics.ui_scale;
 }
 
-static float keyboard_button_center_x(const AppState *state) {
-    return state->keyboard_layout.bubble_rect.x + (state->keyboard_layout.bubble_rect.w * 0.5f);
-}
-
-static float keyboard_button_center_y(const AppState *state) {
-    return state->keyboard_layout.bubble_rect.y + (state->keyboard_layout.bubble_rect.h * 0.5f);
-}
-
 static const char *mode_key(AppMode mode) {
     switch (mode) {
         case APP_MODE_STANDARD:
             return "standard";
-        case APP_MODE_CODING:
-            return "coding";
         case APP_MODE_TERMINAL:
             return "terminal";
         default:
@@ -226,12 +249,20 @@ static const char *mode_key(AppMode mode) {
     }
 }
 
+static const char *control_mode_key(ControlMode mode) {
+    switch (mode) {
+        case CONTROL_MODE_HOTKEY:
+            return "hotkey";
+        case CONTROL_MODE_WIDGET:
+        default:
+            return "widget";
+    }
+}
+
 static const char *mode_label(AppMode mode) {
     switch (mode) {
         case APP_MODE_STANDARD:
             return "Standard";
-        case APP_MODE_CODING:
-            return "Coding";
         case APP_MODE_TERMINAL:
             return "Terminal";
         default:
@@ -239,12 +270,69 @@ static const char *mode_label(AppMode mode) {
     }
 }
 
+static const char *control_mode_label(ControlMode mode) {
+    switch (mode) {
+        case CONTROL_MODE_HOTKEY:
+            return "Hotkey";
+        case CONTROL_MODE_WIDGET:
+        default:
+            return "Widget";
+    }
+}
+
+static const char *transcription_backend_env_value(TbTranscriptionBackendKind backend) {
+    switch (backend) {
+        case TB_TRANSCRIPTION_BACKEND_NPU:
+            return "npu";
+        case TB_TRANSCRIPTION_BACKEND_OPENAI:
+        default:
+            return "openai";
+    }
+}
+
+static const char *transcription_backend_label(TbTranscriptionBackendKind backend) {
+    switch (backend) {
+        case TB_TRANSCRIPTION_BACKEND_NPU:
+            return "NPU";
+        case TB_TRANSCRIPTION_BACKEND_OPENAI:
+        default:
+            return "OpenAI";
+    }
+}
+
+static const char *selected_npu_model_id(const TbTranscriptionConfig *config) {
+    if (config != NULL) {
+        if (config->npu_model[0] != '\0') {
+            return config->npu_model;
+        }
+        if (config->backend == TB_TRANSCRIPTION_BACKEND_NPU && config->model[0] != '\0') {
+            return config->model;
+        }
+    }
+
+    return "whisper_base_en";
+}
+
+static const char *npu_model_label(const char *model_id) {
+    if (model_id != NULL) {
+        if (SDL_strcmp(model_id, "whisper_tiny_en") == 0) {
+            return "Tiny";
+        }
+        if (SDL_strcmp(model_id, "whisper_small_en") == 0) {
+            return "Small";
+        }
+        if (SDL_strcmp(model_id, "whisper_large_v3_turbo") == 0) {
+            return "Large V3 Turbo";
+        }
+    }
+
+    return "Base";
+}
+
 static const char *mode_prompt(AppMode mode) {
     switch (mode) {
         case APP_MODE_STANDARD:
             return "This is spoken dictation. Remove filler words and false starts, add light punctuation, and preserve intent.";
-        case APP_MODE_CODING:
-            return "This is spoken dictation for coding agents like Codex and Claude. Preserve commands, flags, filenames, paths, repo names, code symbols, and technical terms exactly whenever possible. Remove filler words and false starts.";
         case APP_MODE_TERMINAL:
             return "This is spoken dictation for terminal work. Preserve shell commands, flags, filenames, paths, quoted text, and punctuation exactly whenever possible. Remove filler words and false starts.";
         default:
@@ -262,6 +350,13 @@ static const char *text_render_mode_key(TbUiTextRenderMode mode) {
     }
 }
 
+static ControlMode parse_control_mode_key(const char *value) {
+    if (value != NULL && SDL_strcmp(value, "hotkey") == 0) {
+        return CONTROL_MODE_HOTKEY;
+    }
+    return CONTROL_MODE_WIDGET;
+}
+
 static TbUiTextRenderMode parse_text_render_mode_key(const char *value) {
     if (value != NULL && SDL_strcmp(value, "engine") == 0) {
         return TB_UI_TEXT_RENDER_ENGINE;
@@ -269,10 +364,15 @@ static TbUiTextRenderMode parse_text_render_mode_key(const char *value) {
     return TB_UI_TEXT_RENDER_SURFACE;
 }
 
+static const char *hotkey_label(void) {
+#ifdef _WIN32
+    return "Ctrl+Alt+Space";
+#else
+    return "Unavailable";
+#endif
+}
+
 static AppMode parse_mode_key(const char *value) {
-    if (SDL_strcmp(value, "coding") == 0) {
-        return APP_MODE_CODING;
-    }
     if (SDL_strcmp(value, "terminal") == 0) {
         return APP_MODE_TERMINAL;
     }
@@ -283,8 +383,6 @@ static ModePalette get_mode_palette(AppMode mode) {
     switch (mode) {
         case APP_MODE_STANDARD:
             return (ModePalette) {42, 212, 138, 64, 79, 255};
-        case APP_MODE_CODING:
-            return (ModePalette) {82, 155, 255, 85, 111, 255};
         case APP_MODE_TERMINAL:
             return (ModePalette) {255, 171, 64, 255, 111, 76};
         default:
@@ -293,7 +391,19 @@ static ModePalette get_mode_palette(AppMode mode) {
 }
 
 static bool is_panel_expanded(const AppState *state) {
-    return state->keyboard_visible || state->listening || state->transcription.processing || state->transcription.show_feedback;
+    return state->listening || state->transcription.processing || state->transcription.show_feedback;
+}
+
+static bool desired_window_visibility(const AppState *state) {
+    if (state == NULL) {
+        return false;
+    }
+
+    if (state->control_mode == CONTROL_MODE_HOTKEY) {
+        return is_panel_expanded(state);
+    }
+
+    return state->widget_visible;
 }
 
 static float current_touch_scale(const AppState *state) {
@@ -306,9 +416,6 @@ static float current_touch_scale(const AppState *state) {
 static int target_window_width(const AppState *state) {
     float touch_scale = current_touch_scale(state);
 
-    if (state->keyboard_visible) {
-        return (int) SDL_roundf((float) TB_KEYBOARD_WINDOW_WIDTH * touch_scale);
-    }
     if (is_panel_expanded(state)) {
         return (int) SDL_roundf((float) EXPANDED_WINDOW_WIDTH * touch_scale);
     }
@@ -318,9 +425,6 @@ static int target_window_width(const AppState *state) {
 static int target_window_height(const AppState *state) {
     float touch_scale = current_touch_scale(state);
 
-    if (state->keyboard_visible) {
-        return (int) SDL_roundf((float) TB_KEYBOARD_WINDOW_HEIGHT * touch_scale);
-    }
     if (is_panel_expanded(state)) {
         return (int) SDL_roundf((float) EXPANDED_WINDOW_HEIGHT * touch_scale);
     }
@@ -401,8 +505,68 @@ static float ui_y_from_normalized_y(const AppState *state, float normalized_y) {
 
 static void request_redraw(AppState *state) {
     if (state != NULL) {
+        if (state->drag_perf.active) {
+            state->drag_perf.redraw_request_count += 1;
+        }
         state->needs_redraw = true;
     }
+}
+
+static double perf_counters_to_ms(const AppState *state, Uint64 counters) {
+    Uint64 frequency = 0;
+
+    if (state == NULL) {
+        return 0.0;
+    }
+
+    frequency = state->perf_counter_freq > 0 ? state->perf_counter_freq : SDL_GetPerformanceFrequency();
+    if (frequency == 0) {
+        return 0.0;
+    }
+
+    return ((double) counters * 1000.0) / (double) frequency;
+}
+
+static void drag_perf_trace_begin(AppState *state) {
+    if (state == NULL || !state->perf_logging_enabled || state->drag_perf.active) {
+        return;
+    }
+
+    SDL_zero(state->drag_perf);
+    state->drag_perf.active = true;
+    state->drag_perf.started_counter = SDL_GetPerformanceCounter();
+}
+
+static void drag_perf_trace_end(AppState *state) {
+    double duration_ms = 0.0;
+    double avg_render_ms = 0.0;
+    double max_render_ms = 0.0;
+
+    if (state == NULL || !state->drag_perf.active) {
+        return;
+    }
+
+    duration_ms = perf_counters_to_ms(state, SDL_GetPerformanceCounter() - state->drag_perf.started_counter);
+    if (state->drag_perf.render_count > 0) {
+        avg_render_ms = perf_counters_to_ms(state, state->drag_perf.render_total_counter) / (double) state->drag_perf.render_count;
+        max_render_ms = perf_counters_to_ms(state, state->drag_perf.render_max_counter);
+    }
+
+    perf_log_message(
+        state,
+        "drag summary surface=%s duration=%.1fms pointer_updates=%u set_window_pos=%u exposes=%u redraw_requests=%u renders=%u avg_render=%.2fms max_render=%.2fms",
+        "widget",
+        duration_ms,
+        state->drag_perf.pointer_update_count,
+        state->drag_perf.window_move_count,
+        state->drag_perf.window_exposed_count,
+        state->drag_perf.redraw_request_count,
+        state->drag_perf.render_count,
+        avg_render_ms,
+        max_render_ms
+    );
+
+    SDL_zero(state->drag_perf);
 }
 
 static void trim_newlines(char *text) {
@@ -448,6 +612,84 @@ static char *build_log_path(void) {
     }
 
     return path;
+}
+
+static char *build_perf_log_path(void) {
+    char *path = NULL;
+
+    if (SDL_CreateDirectory(TERMINAL_BUDDY_SOURCE_DIR "/logs")) {
+        if (SDL_asprintf(&path, "%s/logs/ui-perf.log", TERMINAL_BUDDY_SOURCE_DIR) < 0) {
+            return NULL;
+        }
+    }
+
+    return path;
+}
+
+static bool env_value_is_truthy(const char *value) {
+    return value != NULL
+        && (SDL_strcmp(value, "1") == 0 || SDL_strcasecmp(value, "true") == 0 || SDL_strcasecmp(value, "yes") == 0);
+}
+
+static bool perf_logging_from_env(void) {
+    return env_value_is_truthy(SDL_getenv("TB_UI_PERF"));
+}
+
+static void perf_log_message(const AppState *state, const char *fmt, ...) {
+    char message[512];
+    va_list args;
+
+    if (state == NULL || !state->perf_logging_enabled || fmt == NULL) {
+        return;
+    }
+
+    va_start(args, fmt);
+    SDL_vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+
+    SDL_Log("%s", message);
+
+    if (g_perf_log_file == NULL) {
+        return;
+    }
+
+    if (g_log_mutex != NULL) {
+        SDL_LockMutex(g_log_mutex);
+    }
+
+    fprintf(g_perf_log_file, "%s\n", message);
+    fflush(g_perf_log_file);
+
+    if (g_log_mutex != NULL) {
+        SDL_UnlockMutex(g_log_mutex);
+    }
+}
+
+static void setup_perf_logging(AppState *state) {
+    if (state == NULL || !state->perf_logging_enabled) {
+        return;
+    }
+
+    if (g_perf_log_path == NULL) {
+        g_perf_log_path = build_perf_log_path();
+    }
+    if (g_perf_log_file == NULL && g_perf_log_path != NULL) {
+        fopen_s(&g_perf_log_file, g_perf_log_path, "a");
+    }
+    if (g_perf_log_file != NULL) {
+        perf_log_message(state, "---- ui perf session ----");
+        perf_log_message(state, "ui perf log path: %s", g_perf_log_path);
+    }
+}
+
+static void shutdown_perf_logging(void) {
+    if (g_perf_log_file != NULL) {
+        fclose(g_perf_log_file);
+        g_perf_log_file = NULL;
+    }
+
+    SDL_free(g_perf_log_path);
+    g_perf_log_path = NULL;
 }
 
 static const char *log_priority_label(SDL_LogPriority priority) {
@@ -529,6 +771,7 @@ static void transcription_set_ui(
     SDL_LockMutex(state->transcription.mutex);
     state->transcription.processing = processing;
     state->transcription.show_feedback = show_feedback;
+    state->transcription.terminal_submit_ready = false;
     if (clipboard_dirty) {
         state->transcription.clipboard_dirty = true;
     }
@@ -542,11 +785,52 @@ static void transcription_set_ui(
     SDL_UnlockMutex(state->transcription.mutex);
 }
 
+static void format_transcription_metrics_text(
+    const TbTranscriptionConfig *config,
+    const TbTranscriptionNpuTimingStats *stats,
+    char *out_text,
+    size_t out_text_size
+) {
+    const char *backend_label = NULL;
+    const char *runtime_state = NULL;
+
+    if (out_text == NULL || out_text_size == 0) {
+        return;
+    }
+
+    out_text[0] = '\0';
+    if (config == NULL || stats == NULL || !stats->valid) {
+        return;
+    }
+
+    backend_label = config->backend_name[0] != '\0' ? config->backend_name : "backend";
+    runtime_state = stats->runtime_cache_hit ? "warm" : "cold";
+
+    SDL_snprintf(
+        out_text,
+        out_text_size,
+        "%s %s | total %.2fs | mel %.0fms | enc %.0fms | dec %.0fms\n%d steps | %d tokens | %d chunk%s | init %.0fms",
+        backend_label,
+        runtime_state,
+        stats->total_ms / 1000.0,
+        stats->feature_ms,
+        stats->encoder_ms,
+        stats->decoder_ms,
+        stats->decoder_steps,
+        stats->emitted_token_count,
+        stats->chunk_count,
+        stats->chunk_count == 1 ? "" : "s",
+        stats->session_init_ms
+    );
+}
+
 static void transcription_clear_feedback(AppState *state) {
     SDL_LockMutex(state->transcription.mutex);
     state->transcription.show_feedback = false;
+    state->transcription.terminal_submit_ready = false;
     state->transcription.status_text[0] = '\0';
     state->transcription.transcript_text[0] = '\0';
+    state->transcription.metrics_text[0] = '\0';
     SDL_UnlockMutex(state->transcription.mutex);
 }
 
@@ -554,101 +838,364 @@ static void copy_transcription_snapshot(
     AppState *state,
     bool *processing,
     bool *show_feedback,
+    bool *terminal_submit_ready,
     char *status_out,
     size_t status_size,
+    char *metrics_out,
+    size_t metrics_size,
     char *transcript_out,
     size_t transcript_size
 ) {
     SDL_LockMutex(state->transcription.mutex);
     *processing = state->transcription.processing;
     *show_feedback = state->transcription.show_feedback;
+    *terminal_submit_ready = state->transcription.terminal_submit_ready;
     SDL_snprintf(status_out, status_size, "%s", state->transcription.status_text);
+    SDL_snprintf(metrics_out, metrics_size, "%s", state->transcription.metrics_text);
     SDL_snprintf(transcript_out, transcript_size, "%s", state->transcription.transcript_text);
     SDL_UnlockMutex(state->transcription.mutex);
 }
 
-static void parse_env_assignment(char *line, char **key, char **value) {
-    char *separator = SDL_strchr(line, '=');
-    if (separator == NULL) {
-        *key = NULL;
-        *value = NULL;
-        return;
-    }
-
-    *separator = '\0';
-    *key = line;
-    *value = separator + 1;
-
-    while (**key == ' ' || **key == '\t') {
-        ++(*key);
-    }
-    while (**value == ' ' || **value == '\t') {
-        ++(*value);
-    }
-
-    if (**value == '"' || **value == '\'') {
-        char quote = **value;
-        char *end = SDL_strrchr(*value + 1, quote);
-        if (end != NULL) {
-            *end = '\0';
-        }
-        ++(*value);
-    }
-}
-
-static void reload_dev_env(AppState *state) {
-    size_t size = 0;
-    void *raw = NULL;
-
-    state->transcription.api_ready = false;
-    state->transcription.api_key[0] = '\0';
-    SDL_snprintf(state->transcription.model, sizeof(state->transcription.model), "%s", "gpt-4o-transcribe");
-
+static void reload_transcription_config(AppState *state) {
     if (state->transcription.env_path == NULL) {
         state->transcription.env_path = build_env_path();
     }
     if (state->transcription.env_path == NULL) {
         return;
     }
+    tb_transcription_reload_env(&state->transcription.config, state->transcription.env_path);
+}
 
-    raw = SDL_LoadFile(state->transcription.env_path, &size);
-    if (raw != NULL) {
-        char *contents = (char *) SDL_malloc(size + 1);
-        if (contents != NULL) {
-            char *context = NULL;
-            char *line = NULL;
+static bool append_text(char **buffer, size_t *length, const char *text) {
+    size_t text_length = 0;
+    char *grown = NULL;
 
-            SDL_memcpy(contents, raw, size);
-            contents[size] = '\0';
-
-            line = strtok_s(contents, "\r\n", &context);
-            while (line != NULL) {
-                char *key = NULL;
-                char *value = NULL;
-
-                if (line[0] != '#' && line[0] != '\0') {
-                    parse_env_assignment(line, &key, &value);
-                    if (key != NULL && value != NULL) {
-                        if (SDL_strcmp(key, "OPENAI_API_KEY") == 0) {
-                            SDL_snprintf(state->transcription.api_key, sizeof(state->transcription.api_key), "%s", value);
-                        } else if (SDL_strcmp(key, "OPENAI_TRANSCRIBE_MODEL") == 0) {
-                            SDL_snprintf(state->transcription.model, sizeof(state->transcription.model), "%s", value);
-                        }
-                    }
-                }
-
-                line = strtok_s(NULL, "\r\n", &context);
-            }
-
-            SDL_free(contents);
-        }
-
-        SDL_free(raw);
+    if (buffer == NULL || length == NULL || text == NULL) {
+        return false;
     }
 
-    trim_newlines(state->transcription.api_key);
-    trim_newlines(state->transcription.model);
-    state->transcription.api_ready = state->transcription.api_key[0] != '\0';
+    text_length = SDL_strlen(text);
+    grown = (char *) SDL_realloc(*buffer, *length + text_length + 1);
+    if (grown == NULL) {
+        return false;
+    }
+
+    SDL_memcpy(grown + *length, text, text_length);
+    *length += text_length;
+    grown[*length] = '\0';
+    *buffer = grown;
+    return true;
+}
+
+static bool write_env_assignment(const char *env_path, const char *key, const char *value, char **out_error) {
+    size_t size = 0;
+    void *raw = NULL;
+    char *contents = NULL;
+    char *rebuilt = NULL;
+    char *context = NULL;
+    char *line = NULL;
+    size_t rebuilt_length = 0;
+    bool found = false;
+    bool ok = false;
+
+    if (out_error != NULL) {
+        *out_error = NULL;
+    }
+
+    if (env_path == NULL || key == NULL || key[0] == '\0' || value == NULL) {
+        if (out_error != NULL) {
+            *out_error = SDL_strdup("Invalid env update request.");
+        }
+        return false;
+    }
+
+    raw = SDL_LoadFile(env_path, &size);
+    if (raw != NULL) {
+        contents = (char *) SDL_malloc(size + 1);
+        if (contents == NULL) {
+            if (out_error != NULL) {
+                *out_error = SDL_strdup("Could not allocate env buffer.");
+            }
+            SDL_free(raw);
+            return false;
+        }
+
+        SDL_memcpy(contents, raw, size);
+        contents[size] = '\0';
+        SDL_free(raw);
+        raw = NULL;
+
+        line = strtok_s(contents, "\r\n", &context);
+        while (line != NULL) {
+            if (SDL_strncmp(line, key, SDL_strlen(key)) == 0 && line[SDL_strlen(key)] == '=') {
+                char *replacement = NULL;
+
+                found = true;
+                if (SDL_asprintf(&replacement, "%s=%s\n", key, value) < 0) {
+                    replacement = NULL;
+                }
+                if (replacement == NULL || !append_text(&rebuilt, &rebuilt_length, replacement)) {
+                    SDL_free(replacement);
+                    if (out_error != NULL) {
+                        *out_error = SDL_strdup("Could not rebuild env file.");
+                    }
+                    goto cleanup;
+                }
+                SDL_free(replacement);
+            } else {
+                if (!append_text(&rebuilt, &rebuilt_length, line) || !append_text(&rebuilt, &rebuilt_length, "\n")) {
+                    if (out_error != NULL) {
+                        *out_error = SDL_strdup("Could not rebuild env file.");
+                    }
+                    goto cleanup;
+                }
+            }
+
+            line = strtok_s(NULL, "\r\n", &context);
+        }
+    }
+
+    if (!found) {
+        if (!append_text(&rebuilt, &rebuilt_length, key)
+            || !append_text(&rebuilt, &rebuilt_length, "=")
+            || !append_text(&rebuilt, &rebuilt_length, value)
+            || !append_text(&rebuilt, &rebuilt_length, "\n")) {
+            if (out_error != NULL) {
+                *out_error = SDL_strdup("Could not append env setting.");
+            }
+            goto cleanup;
+        }
+    }
+
+    SDL_CreateDirectory(TERMINAL_BUDDY_SOURCE_DIR "/.env");
+    if (!SDL_SaveFile(env_path, rebuilt != NULL ? rebuilt : "", rebuilt_length)) {
+        if (out_error != NULL) {
+            SDL_asprintf(out_error, "SDL_SaveFile failed while updating %s: %s", env_path, SDL_GetError());
+        }
+        goto cleanup;
+    }
+
+    ok = true;
+
+cleanup:
+    SDL_free(contents);
+    SDL_free(rebuilt);
+    return ok;
+}
+
+static bool switch_transcription_backend(AppState *state, TbTranscriptionBackendKind backend) {
+    TbTranscriptionBackendKind previous_backend = TB_TRANSCRIPTION_BACKEND_OPENAI;
+    char detail[MAX_TRANSCRIPT_TEXT];
+    char *error_text = NULL;
+
+    if (state == NULL) {
+        return false;
+    }
+
+    if (state->listening || ui_is_processing(state)) {
+        transcription_set_ui(
+            state,
+            false,
+            true,
+            false,
+            "BACKEND LOCKED",
+            "Stop recording before switching transcription backends."
+        );
+        request_redraw(state);
+        return false;
+    }
+
+    if (state->transcription.env_path == NULL) {
+        state->transcription.env_path = build_env_path();
+    }
+    if (state->transcription.env_path == NULL) {
+        transcription_set_ui(
+            state,
+            false,
+            true,
+            false,
+            "BACKEND SWITCH FAILED",
+            "Could not resolve the local transcription env file."
+        );
+        request_redraw(state);
+        return false;
+    }
+
+    previous_backend = state->transcription.config.backend;
+    if (previous_backend == backend) {
+        refresh_shell_state(state);
+        return true;
+    }
+
+    if (!write_env_assignment(
+            state->transcription.env_path,
+            "TB_TRANSCRIPTION_BACKEND",
+            transcription_backend_env_value(backend),
+            &error_text
+        )) {
+        transcription_set_ui(
+            state,
+            false,
+            true,
+            false,
+            "BACKEND SWITCH FAILED",
+            error_text != NULL ? error_text : "Could not update the transcription backend setting."
+        );
+        SDL_free(error_text);
+        request_redraw(state);
+        return false;
+    }
+
+    if (previous_backend == TB_TRANSCRIPTION_BACKEND_NPU && backend != TB_TRANSCRIPTION_BACKEND_NPU) {
+        tb_transcription_backend_npu_shutdown();
+    }
+
+    reload_transcription_config(state);
+    refresh_shell_state(state);
+
+    if (state->transcription.config.ready) {
+        SDL_snprintf(
+            detail,
+            sizeof(detail),
+            "Future recordings will use %s.",
+            transcription_backend_label(state->transcription.config.backend)
+        );
+        transcription_set_ui(
+            state,
+            false,
+            true,
+            false,
+            "BACKEND CHANGED",
+            detail
+        );
+    } else {
+        transcription_set_ui(
+            state,
+            false,
+            true,
+            false,
+            state->transcription.config.missing_status,
+            state->transcription.config.missing_detail
+        );
+    }
+
+    request_redraw(state);
+    return true;
+}
+
+static bool switch_npu_model(AppState *state, const char *model_id) {
+    char detail[MAX_TRANSCRIPT_TEXT];
+    char *error_text = NULL;
+
+    if (state == NULL || model_id == NULL || model_id[0] == '\0') {
+        return false;
+    }
+
+    if (state->listening || ui_is_processing(state)) {
+        transcription_set_ui(
+            state,
+            false,
+            true,
+            false,
+            "MODEL LOCKED",
+            "Stop recording before switching NPU models."
+        );
+        request_redraw(state);
+        return false;
+    }
+
+    if (state->transcription.env_path == NULL) {
+        state->transcription.env_path = build_env_path();
+    }
+    if (state->transcription.env_path == NULL) {
+        transcription_set_ui(
+            state,
+            false,
+            true,
+            false,
+            "MODEL SWITCH FAILED",
+            "Could not resolve the local transcription env file."
+        );
+        request_redraw(state);
+        return false;
+    }
+
+    if (SDL_strcmp(selected_npu_model_id(&state->transcription.config), model_id) == 0) {
+        refresh_shell_state(state);
+        return true;
+    }
+
+    if (!write_env_assignment(
+            state->transcription.env_path,
+            "TB_TRANSCRIPTION_MODEL",
+            model_id,
+            &error_text
+        )) {
+        transcription_set_ui(
+            state,
+            false,
+            true,
+            false,
+            "MODEL SWITCH FAILED",
+            error_text != NULL ? error_text : "Could not update the NPU model setting."
+        );
+        SDL_free(error_text);
+        request_redraw(state);
+        return false;
+    }
+
+    if (state->transcription.config.backend == TB_TRANSCRIPTION_BACKEND_NPU) {
+        tb_transcription_backend_npu_shutdown();
+    }
+
+    reload_transcription_config(state);
+    refresh_shell_state(state);
+
+    if (state->transcription.config.backend == TB_TRANSCRIPTION_BACKEND_NPU) {
+        if (state->transcription.config.ready) {
+            SDL_snprintf(
+                detail,
+                sizeof(detail),
+                "Future recordings will use the NPU %s model.",
+                npu_model_label(selected_npu_model_id(&state->transcription.config))
+            );
+            transcription_set_ui(
+                state,
+                false,
+                true,
+                false,
+                "MODEL CHANGED",
+                detail
+            );
+        } else {
+            transcription_set_ui(
+                state,
+                false,
+                true,
+                false,
+                state->transcription.config.missing_status,
+                state->transcription.config.missing_detail
+            );
+        }
+    } else {
+        SDL_snprintf(
+            detail,
+            sizeof(detail),
+            "Saved the NPU %s model. Switch backend to NPU to use it.",
+            npu_model_label(selected_npu_model_id(&state->transcription.config))
+        );
+        transcription_set_ui(
+            state,
+            false,
+            true,
+            false,
+            "MODEL SAVED",
+            detail
+        );
+    }
+
+    request_redraw(state);
+    return true;
 }
 
 static void save_preferences(const AppState *state) {
@@ -660,10 +1207,11 @@ static void save_preferences(const AppState *state) {
 
     if (SDL_asprintf(
             &contents,
-            "window_x=%d\nwindow_y=%d\nmode=%s\ntext_mode=%s\ntext_debug=%d\n",
+            "window_x=%d\nwindow_y=%d\nmode=%s\ncontrol_mode=%s\ntext_mode=%s\ntext_debug=%d\n",
             state->window_x,
             state->window_y,
             mode_key(state->mode),
+            control_mode_key(state->control_mode),
             text_render_mode_key(state->text_render_mode),
             state->text_debug_logging ? 1 : 0
         ) < 0) {
@@ -685,6 +1233,8 @@ static void load_preferences(AppState *state) {
     state->window_x = 64;
     state->window_y = 64;
     state->mode = APP_MODE_STANDARD;
+    state->control_mode = CONTROL_MODE_WIDGET;
+    state->widget_visible = true;
     state->text_render_mode = TB_UI_TEXT_RENDER_SURFACE;
     state->text_debug_logging = false;
 
@@ -711,6 +1261,8 @@ static void load_preferences(AppState *state) {
                     state->window_y = atoi(line + 9);
                 } else if (SDL_strncmp(line, "mode=", 5) == 0) {
                     state->mode = parse_mode_key(line + 5);
+                } else if (SDL_strncmp(line, "control_mode=", 13) == 0) {
+                    state->control_mode = parse_control_mode_key(line + 13);
                 } else if (SDL_strncmp(line, "text_mode=", 10) == 0) {
                     state->text_render_mode = parse_text_render_mode_key(line + 10);
                 } else if (SDL_strncmp(line, "text_debug=", 11) == 0) {
@@ -737,7 +1289,60 @@ static bool resize_for_mode(AppState *state) {
     }
 
     sync_window_metrics(state);
+    clamp_window_to_display(state);
     return true;
+}
+
+static void sync_window_position_from_os(AppState *state) {
+    int window_x = 0;
+    int window_y = 0;
+
+    if (state == NULL || state->window == NULL) {
+        return;
+    }
+
+    if (SDL_GetWindowPosition(state->window, &window_x, &window_y)) {
+        state->window_x = window_x;
+        state->window_y = window_y;
+    }
+}
+
+static void clamp_window_to_display(AppState *state) {
+    SDL_DisplayID display_id = 0;
+    SDL_Rect usable_bounds;
+    int width = 0;
+    int height = 0;
+    int min_x = 0;
+    int min_y = 0;
+    int max_x = 0;
+    int max_y = 0;
+    int clamped_x = 0;
+    int clamped_y = 0;
+
+    if (state == NULL || state->window == NULL) {
+        return;
+    }
+
+    sync_window_position_from_os(state);
+    display_id = SDL_GetDisplayForWindow(state->window);
+    if (display_id == 0 || !SDL_GetDisplayUsableBounds(display_id, &usable_bounds)) {
+        return;
+    }
+
+    width = target_window_width(state);
+    height = target_window_height(state);
+    min_x = usable_bounds.x;
+    min_y = usable_bounds.y;
+    max_x = usable_bounds.x + SDL_max(usable_bounds.w - width, 0);
+    max_y = usable_bounds.y + SDL_max(usable_bounds.h - height, 0);
+    clamped_x = SDL_clamp(state->window_x, min_x, max_x);
+    clamped_y = SDL_clamp(state->window_y, min_y, max_y);
+
+    if (clamped_x != state->window_x || clamped_y != state->window_y) {
+        state->window_x = clamped_x;
+        state->window_y = clamped_y;
+        SDL_SetWindowPosition(state->window, state->window_x, state->window_y);
+    }
 }
 
 static void clear_audio_visuals(AppState *state) {
@@ -874,11 +1479,16 @@ static void update_audio_meter(AppState *state) {
 }
 
 static void update_tray_checks(AppState *state) {
+    const char *npu_model = selected_npu_model_id(&state->transcription.config);
+
+    if (state->tray.control_widget != NULL) {
+        SDL_SetTrayEntryChecked(state->tray.control_widget, state->control_mode == CONTROL_MODE_WIDGET);
+    }
+    if (state->tray.control_hotkey != NULL) {
+        SDL_SetTrayEntryChecked(state->tray.control_hotkey, state->control_mode == CONTROL_MODE_HOTKEY);
+    }
     if (state->tray.mode_standard != NULL) {
         SDL_SetTrayEntryChecked(state->tray.mode_standard, state->mode == APP_MODE_STANDARD);
-    }
-    if (state->tray.mode_coding != NULL) {
-        SDL_SetTrayEntryChecked(state->tray.mode_coding, state->mode == APP_MODE_CODING);
     }
     if (state->tray.mode_terminal != NULL) {
         SDL_SetTrayEntryChecked(state->tray.mode_terminal, state->mode == APP_MODE_TERMINAL);
@@ -891,6 +1501,24 @@ static void update_tray_checks(AppState *state) {
     }
     if (state->tray.text_debug != NULL) {
         SDL_SetTrayEntryChecked(state->tray.text_debug, state->text_debug_logging);
+    }
+    if (state->tray.backend_openai != NULL) {
+        SDL_SetTrayEntryChecked(state->tray.backend_openai, state->transcription.config.backend == TB_TRANSCRIPTION_BACKEND_OPENAI);
+    }
+    if (state->tray.backend_npu != NULL) {
+        SDL_SetTrayEntryChecked(state->tray.backend_npu, state->transcription.config.backend == TB_TRANSCRIPTION_BACKEND_NPU);
+    }
+    if (state->tray.npu_model_tiny != NULL) {
+        SDL_SetTrayEntryChecked(state->tray.npu_model_tiny, SDL_strcmp(npu_model, "whisper_tiny_en") == 0);
+    }
+    if (state->tray.npu_model_base != NULL) {
+        SDL_SetTrayEntryChecked(state->tray.npu_model_base, SDL_strcmp(npu_model, "whisper_base_en") == 0);
+    }
+    if (state->tray.npu_model_small != NULL) {
+        SDL_SetTrayEntryChecked(state->tray.npu_model_small, SDL_strcmp(npu_model, "whisper_small_en") == 0);
+    }
+    if (state->tray.npu_model_turbo != NULL) {
+        SDL_SetTrayEntryChecked(state->tray.npu_model_turbo, SDL_strcmp(npu_model, "whisper_large_v3_turbo") == 0);
     }
 }
 
@@ -920,20 +1548,44 @@ static void update_tray_icon(AppState *state) {
 }
 
 static void update_tray_labels(AppState *state) {
-    char tooltip[128];
+    char model_label[96];
+    char tooltip[160];
+    const char *backend = NULL;
 
     if (state->tray.show_hide != NULL) {
-        SDL_SetTrayEntryLabel(state->tray.show_hide, state->visible ? "Hide Button" : "Show Button");
+        if (state->control_mode == CONTROL_MODE_HOTKEY) {
+            SDL_SetTrayEntryLabel(state->tray.show_hide, "Hotkey Mode Active");
+        } else {
+            SDL_SetTrayEntryLabel(state->tray.show_hide, state->widget_visible ? "Hide Widget" : "Show Widget");
+        }
     }
+
+    if (state->tray.npu_model_parent != NULL) {
+        SDL_snprintf(
+            model_label,
+            sizeof(model_label),
+            "NPU Model (%s)",
+            npu_model_label(selected_npu_model_id(&state->transcription.config))
+        );
+        SDL_SetTrayEntryLabel(state->tray.npu_model_parent, model_label);
+    }
+
+    backend = state->transcription.config.backend_name[0] != '\0'
+        ? state->transcription.config.backend_name
+        : transcription_backend_label(state->transcription.config.backend);
 
     if (state->tray.tray != NULL) {
         SDL_snprintf(
             tooltip,
             sizeof(tooltip),
-            "terminal-buddy (%s mode, %s text)",
+            "terminal-buddy (%s backend, %s control, %s prompt, %s text%s%s)",
+            backend,
+            control_mode_label(state->control_mode),
             mode_label(state->mode)
             ,
-            state->text_render_mode == TB_UI_TEXT_RENDER_ENGINE ? "engine" : "surface"
+            state->text_render_mode == TB_UI_TEXT_RENDER_ENGINE ? "engine" : "surface",
+            state->control_mode == CONTROL_MODE_HOTKEY ? ", " : "",
+            state->control_mode == CONTROL_MODE_HOTKEY ? hotkey_label() : ""
         );
         SDL_SetTrayTooltip(state->tray.tray, tooltip);
     }
@@ -967,48 +1619,11 @@ static void set_text_debug_logging(AppState *state, bool enabled, bool persist) 
     }
 }
 
-static void clear_keyboard_press(AppState *state) {
-    state->keyboard_press.kind = POINTER_NONE;
-    state->keyboard_press.finger_id = 0;
-    state->keyboard_press.pressed = false;
-    state->keyboard_press.armed = false;
-    state->keyboard_press.key_index = -1;
-    state->keyboard_press.next_repeat_ms = 0;
-}
-
-static void hide_keyboard(AppState *state) {
-    state->keyboard_visible = false;
-    clear_keyboard_press(state);
-    tb_keyboard_mod_init(&state->keyboard_mods);
-    resize_for_mode(state);
-    request_redraw(state);
-}
-
-static void show_keyboard(AppState *state) {
-    if (state->listening || state->transcription.processing) {
-        return;
-    }
-
-    transcription_clear_feedback(state);
-    state->keyboard_visible = true;
-    clear_keyboard_press(state);
-#ifdef _WIN32
-    state->injection_target_hwnd = state->last_external_hwnd;
-#endif
-    resize_for_mode(state);
-    tb_keyboard_build_layout(
-        state->window_metrics.pixel_width,
-        state->window_metrics.pixel_height,
-        state->window_metrics.ui_scale,
-        &state->keyboard_layout
-    );
-    request_redraw(state);
-}
-
 static void collapse_panel(AppState *state) {
     transcription_clear_feedback(state);
     clear_audio_visuals(state);
     resize_for_mode(state);
+    apply_window_visibility_policy(state);
     request_redraw(state);
 }
 
@@ -1028,10 +1643,6 @@ static void start_listening(AppState *state) {
         return;
     }
 
-    if (state->keyboard_visible) {
-        hide_keyboard(state);
-    }
-
     if (!state->audio.ready || state->audio.stream == NULL) {
         transcription_set_ui(
             state,
@@ -1042,6 +1653,7 @@ static void start_listening(AppState *state) {
             "SDL could not open the default recording device."
         );
         resize_for_mode(state);
+        apply_window_visibility_policy(state);
         return;
     }
 
@@ -1062,16 +1674,18 @@ static void start_listening(AppState *state) {
             SDL_GetError()
         );
         resize_for_mode(state);
+        apply_window_visibility_policy(state);
         request_redraw(state);
         return;
     }
 
     state->listening = true;
     resize_for_mode(state);
+    apply_window_visibility_policy(state);
     request_redraw(state);
 }
 
-static void set_window_visibility(AppState *state, bool visible) {
+static void set_actual_window_visibility(AppState *state, bool visible) {
     if (state->visible == visible) {
         return;
     }
@@ -1085,15 +1699,26 @@ static void set_window_visibility(AppState *state, bool visible) {
         if (state->listening) {
             stop_listening(state);
         }
-        if (state->keyboard_visible) {
-            hide_keyboard(state);
-        }
         SDL_HideWindow(state->window);
         SDL_SyncWindow(state->window);
     }
 
     update_tray_labels(state);
     request_redraw(state);
+}
+
+static void apply_window_visibility_policy(AppState *state) {
+    set_actual_window_visibility(state, desired_window_visibility(state));
+}
+
+static void set_widget_visibility_preference(AppState *state, bool visible) {
+    if (state->widget_visible == visible) {
+        return;
+    }
+
+    state->widget_visible = visible;
+    apply_window_visibility_policy(state);
+    update_tray_labels(state);
 }
 
 static void set_mode(AppState *state, AppMode mode, bool persist) {
@@ -1112,6 +1737,33 @@ static void set_mode(AppState *state, AppMode mode, bool persist) {
     request_redraw(state);
 }
 
+static bool set_control_mode(AppState *state, ControlMode mode, bool persist) {
+    ControlMode previous_mode = state->control_mode;
+
+    if (state->control_mode == mode) {
+        update_tray_checks(state);
+        update_tray_labels(state);
+        return true;
+    }
+
+    state->control_mode = mode;
+    if (!update_hotkey_registration(state)) {
+        state->control_mode = previous_mode;
+        update_hotkey_registration(state);
+        refresh_shell_state(state);
+        return false;
+    }
+
+    apply_window_visibility_policy(state);
+    refresh_shell_state(state);
+
+    if (persist) {
+        save_preferences(state);
+    }
+
+    return true;
+}
+
 static bool point_in_circle(float x, float y, float center_x, float center_y, float radius) {
     float dx = x - center_x;
     float dy = y - center_y;
@@ -1119,13 +1771,6 @@ static bool point_in_circle(float x, float y, float center_x, float center_y, fl
 }
 
 static bool point_in_active_surface(const AppState *state, float x, float y) {
-    if (state->keyboard_visible) {
-        return x >= 0.0f
-            && y >= 0.0f
-            && x <= (float) state->window_metrics.pixel_width
-            && y <= (float) state->window_metrics.pixel_height;
-    }
-
     if (is_panel_expanded(state)) {
         return x >= 0.0f
             && y >= 0.0f
@@ -1142,103 +1787,6 @@ static bool point_in_active_surface(const AppState *state, float x, float y) {
     );
 }
 
-static const TbKeyboardKeyRect *keyboard_hit_at(AppState *state, float local_x, float local_y) {
-    return tb_keyboard_hit_test(&state->keyboard_layout, local_x, local_y);
-}
-
-static bool emit_keyboard_spec(AppState *state, const TbKeyboardKeySpec *spec) {
-    bool emitted = false;
-
-    if (spec == NULL) {
-        return false;
-    }
-
-    switch (spec->action) {
-        case TB_KEYBOARD_ACTION_SHIFT:
-            tb_keyboard_toggle_shift(&state->keyboard_mods, SDL_GetTicks());
-            request_redraw(state);
-            return true;
-        case TB_KEYBOARD_ACTION_CTRL:
-            tb_keyboard_toggle_ctrl(&state->keyboard_mods);
-            request_redraw(state);
-            return true;
-        case TB_KEYBOARD_ACTION_ALT:
-            tb_keyboard_toggle_alt(&state->keyboard_mods);
-            request_redraw(state);
-            return true;
-        default:
-            break;
-    }
-
-#ifdef _WIN32
-    if (state->injection_target_hwnd == NULL || !IsWindow(state->injection_target_hwnd)) {
-        state->injection_target_hwnd = state->last_external_hwnd;
-    }
-    emitted = tb_keyboard_emit_key(state->injection_target_hwnd, spec, &state->keyboard_mods);
-#else
-    emitted = false;
-#endif
-
-    tb_keyboard_auto_release(&state->keyboard_mods);
-    request_redraw(state);
-    return emitted;
-}
-
-static void begin_keyboard_press(AppState *state, PointerKind kind, SDL_FingerID finger_id, int key_index) {
-    state->keyboard_press.kind = kind;
-    state->keyboard_press.finger_id = finger_id;
-    state->keyboard_press.pressed = true;
-    state->keyboard_press.armed = true;
-    state->keyboard_press.key_index = key_index;
-    state->keyboard_press.next_repeat_ms = SDL_GetTicks() + TB_KEYBOARD_REPEAT_INITIAL_MS;
-    request_redraw(state);
-}
-
-static void update_keyboard_press(AppState *state, float local_x, float local_y) {
-    const TbKeyboardKeyRect *hit = NULL;
-
-    if (!state->keyboard_press.pressed) {
-        return;
-    }
-
-    hit = keyboard_hit_at(state, local_x, local_y);
-    state->keyboard_press.armed = hit != NULL && hit->index == state->keyboard_press.key_index;
-    request_redraw(state);
-}
-
-static void end_keyboard_press(AppState *state) {
-    const TbKeyboardKeyRect *key = tb_keyboard_key_rect_at(&state->keyboard_layout, state->keyboard_press.key_index);
-    bool should_emit = state->keyboard_press.pressed && state->keyboard_press.armed && key != NULL;
-
-    clear_keyboard_press(state);
-
-    if (should_emit) {
-        emit_keyboard_spec(state, key->spec);
-    } else {
-        request_redraw(state);
-    }
-}
-
-static void pump_keyboard_repeat(AppState *state) {
-    const TbKeyboardKeyRect *key = NULL;
-    Uint64 now_ms = 0;
-
-    if (!state->keyboard_visible || !state->keyboard_press.pressed || !state->keyboard_press.armed) {
-        return;
-    }
-
-    key = tb_keyboard_key_rect_at(&state->keyboard_layout, state->keyboard_press.key_index);
-    if (key == NULL || key->spec == NULL || !key->spec->repeatable) {
-        return;
-    }
-
-    now_ms = SDL_GetTicks();
-    while (state->keyboard_press.next_repeat_ms > 0 && now_ms >= state->keyboard_press.next_repeat_ms) {
-        emit_keyboard_spec(state, key->spec);
-        state->keyboard_press.next_repeat_ms += TB_KEYBOARD_REPEAT_INTERVAL_MS;
-    }
-}
-
 static void begin_pointer_interaction(
     AppState *state,
     PointerKind kind,
@@ -1248,50 +1796,21 @@ static void begin_pointer_interaction(
     float global_x,
     float global_y
 ) {
-    if (state->keyboard_visible) {
-        if (point_in_circle(
-            local_x,
-            local_y,
-            keyboard_button_center_x(state),
-            keyboard_button_center_y(state),
-            state->keyboard_layout.bubble_rect.w * 0.5f
-        )) {
-            state->drag.kind = kind;
-            state->drag.finger_id = finger_id;
-            state->drag.pressed = true;
-            state->drag.dragging = false;
-            state->drag.pending_toggle = true;
-            state->drag.long_press_fired = false;
-            state->drag.start_global_x = global_x;
-            state->drag.start_global_y = global_y;
-            state->drag.window_start_x = state->window_x;
-            state->drag.window_start_y = state->window_y;
-            state->drag.pressed_at_ms = SDL_GetTicks();
-            return;
-        }
-
-        const TbKeyboardKeyRect *key = keyboard_hit_at(state, local_x, local_y);
-        if (key != NULL) {
-            begin_keyboard_press(state, kind, finger_id, key->index);
-        }
-        return;
-    }
-
     if (!point_in_active_surface(state, local_x, local_y)) {
         return;
     }
 
+    clamp_window_to_display(state);
+    sync_window_position_from_os(state);
     state->drag.kind = kind;
     state->drag.finger_id = finger_id;
     state->drag.pressed = true;
     state->drag.dragging = false;
     state->drag.pending_toggle = true;
-    state->drag.long_press_fired = false;
     state->drag.start_global_x = global_x;
     state->drag.start_global_y = global_y;
     state->drag.window_start_x = state->window_x;
     state->drag.window_start_y = state->window_y;
-    state->drag.pressed_at_ms = SDL_GetTicks();
 }
 
 static void update_pointer_interaction(AppState *state, float global_x, float global_y) {
@@ -1310,20 +1829,59 @@ static void update_pointer_interaction(AppState *state, float global_x, float gl
         if (moved >= squaref(DRAG_THRESHOLD * state->window_metrics.ui_scale)) {
             state->drag.dragging = true;
             state->drag.pending_toggle = false;
+            drag_perf_trace_begin(state);
         }
     }
 
     if (state->drag.dragging) {
-        state->window_x = state->drag.window_start_x + (int) SDL_roundf(delta_x);
-        state->window_y = state->drag.window_start_y + (int) SDL_roundf(delta_y);
-        SDL_SetWindowPosition(state->window, state->window_x, state->window_y);
-        request_redraw(state);
+        int next_window_x = state->drag.window_start_x + (int) SDL_roundf(delta_x);
+        int next_window_y = state->drag.window_start_y + (int) SDL_roundf(delta_y);
+
+        if (state->drag_perf.active) {
+            state->drag_perf.pointer_update_count += 1;
+        }
+
+        if (next_window_x != state->window_x || next_window_y != state->window_y) {
+            state->window_x = next_window_x;
+            state->window_y = next_window_y;
+            SDL_SetWindowPosition(state->window, state->window_x, state->window_y);
+            if (state->drag_perf.active) {
+                state->drag_perf.window_move_count += 1;
+            }
+        }
     }
 }
 
 static void handle_panel_tap(AppState *state);
 
-static void end_pointer_interaction(AppState *state) {
+static bool handle_feedback_primary_action_tap(AppState *state, float local_x, float local_y) {
+    bool terminal_submit_ready = false;
+
+    if (state == NULL || !tb_ui_primary_action_contains(local_x, local_y)) {
+        return false;
+    }
+
+    SDL_LockMutex(state->transcription.mutex);
+    terminal_submit_ready = state->transcription.terminal_submit_ready;
+    SDL_UnlockMutex(state->transcription.mutex);
+
+    if (!terminal_submit_ready) {
+        return false;
+    }
+
+    if (try_submit_terminal_target(state)) {
+        collapse_panel(state);
+    } else {
+        SDL_LockMutex(state->transcription.mutex);
+        SDL_snprintf(state->transcription.status_text, sizeof(state->transcription.status_text), "%s", "ENTER FAILED");
+        SDL_UnlockMutex(state->transcription.mutex);
+        request_redraw(state);
+    }
+
+    return true;
+}
+
+static void end_pointer_interaction(AppState *state, float local_x, float local_y) {
     bool should_toggle = state->drag.pressed && state->drag.pending_toggle && !state->drag.dragging;
     bool moved = state->drag.dragging;
 
@@ -1332,63 +1890,46 @@ static void end_pointer_interaction(AppState *state) {
     state->drag.pressed = false;
     state->drag.dragging = false;
     state->drag.pending_toggle = false;
-    state->drag.long_press_fired = false;
-    state->drag.pressed_at_ms = 0;
 
-    if (should_toggle) {
+    if (should_toggle && !handle_feedback_primary_action_tap(state, local_x, local_y)) {
         handle_panel_tap(state);
     }
 
     if (moved) {
         save_preferences(state);
+        drag_perf_trace_end(state);
     }
 
     request_redraw(state);
 }
 
-static void pump_bubble_long_press(AppState *state) {
-    Uint64 now_ms = 0;
-
-    if (
-        state->keyboard_visible
-        || state->listening
-        || state->transcription.processing
-        || state->transcription.show_feedback
-        || state->drag.long_press_fired
-        || !state->drag.pressed
-        || state->drag.dragging
-        || !state->drag.pending_toggle
-    ) {
-        return;
-    }
-
-    now_ms = SDL_GetTicks();
-    if (state->drag.pressed_at_ms == 0 || now_ms - state->drag.pressed_at_ms < KEYBOARD_LONG_PRESS_MS) {
-        return;
-    }
-
-    state->drag.long_press_fired = true;
-    state->drag.pending_toggle = false;
-    show_keyboard(state);
-}
-
 static void render(AppState *state) {
+    Uint64 render_counter_start = 0;
     Uint64 ticks_ms = SDL_GetTicks();
     float pulse = 0.5f + (0.5f * SDL_sinf((float) ticks_ms * 0.0065f));
     bool processing = false;
     bool show_feedback = false;
+    bool terminal_submit_ready = false;
     char status[MAX_STATUS_TEXT];
+    char metrics[MAX_METRICS_TEXT];
     char transcript[MAX_TRANSCRIPT_TEXT];
     TbUiModel model;
 
     SDL_zero(model);
 
+    if (state->drag_perf.active) {
+        render_counter_start = SDL_GetPerformanceCounter();
+    }
+
     copy_transcription_snapshot(
         state,
         &processing,
         &show_feedback,
+        &terminal_submit_ready,
         status,
         sizeof(status),
+        metrics,
+        sizeof(metrics),
         transcript,
         sizeof(transcript)
     );
@@ -1398,22 +1939,7 @@ static void render(AppState *state) {
     model.window_height = state->window_metrics.pixel_height;
     model.ui_scale = state->window_metrics.ui_scale;
 
-    if (state->keyboard_visible) {
-        tb_keyboard_build_layout(model.window_width, model.window_height, model.ui_scale, &state->keyboard_layout);
-        for (int index = 0; index < state->keyboard_layout.key_count && index < TB_KEYBOARD_MAX_KEYS; ++index) {
-            const TbKeyboardKeyRect *key = &state->keyboard_layout.keys[index];
-            const char *label = tb_keyboard_display_label(
-                key->spec,
-                &state->keyboard_mods,
-                state->keyboard_labels[index],
-                sizeof(state->keyboard_labels[index])
-            );
-            if (label != state->keyboard_labels[index]) {
-                SDL_snprintf(state->keyboard_labels[index], sizeof(state->keyboard_labels[index]), "%s", label);
-            }
-        }
-        model.scene = TB_UI_SCENE_KEYBOARD;
-    } else if (state->listening) {
+    if (state->listening) {
         model.scene = TB_UI_SCENE_LISTENING;
     } else if (processing) {
         model.scene = TB_UI_SCENE_PROCESSING;
@@ -1429,15 +1955,23 @@ static void render(AppState *state) {
     model.audio_history = state->audio.history;
     model.audio_history_count = AUDIO_HISTORY_COUNT;
     model.mode_label = mode_label(state->mode);
+    model.backend_label = state->transcription.config.backend_name[0] != '\0' ? state->transcription.config.backend_name : NULL;
     model.status_text = status[0] != '\0' ? status : NULL;
+    model.metrics_text = metrics[0] != '\0' ? metrics : NULL;
     model.transcript_text = transcript[0] != '\0' ? transcript : NULL;
-    model.keyboard_layout = state->keyboard_visible ? &state->keyboard_layout : NULL;
-    model.keyboard_mods = &state->keyboard_mods;
-    model.keyboard_labels = state->keyboard_labels;
-    model.keyboard_pressed_key = state->keyboard_press.pressed && state->keyboard_press.armed ? state->keyboard_press.key_index : -1;
+    model.primary_action_label = terminal_submit_ready ? "Enter" : NULL;
 
     if (!tb_ui_render(&model)) {
         SDL_Log("tb_ui_render failed");
+    }
+
+    if (state->drag_perf.active && render_counter_start > 0) {
+        Uint64 render_elapsed = SDL_GetPerformanceCounter() - render_counter_start;
+        state->drag_perf.render_count += 1;
+        state->drag_perf.render_total_counter += render_elapsed;
+        if (render_elapsed > state->drag_perf.render_max_counter) {
+            state->drag_perf.render_max_counter = render_elapsed;
+        }
     }
 
     state->needs_redraw = false;
@@ -1467,14 +2001,6 @@ static void handle_mouse_down(AppState *state, const SDL_MouseButtonEvent *butto
 static void handle_mouse_motion(AppState *state) {
     float global_x = 0.0f;
     float global_y = 0.0f;
-    float local_x = 0.0f;
-    float local_y = 0.0f;
-
-    if (state->keyboard_press.kind == POINTER_MOUSE) {
-        SDL_GetMouseState(&local_x, &local_y);
-        update_keyboard_press(state, ui_x_from_window_x(state, local_x), ui_y_from_window_y(state, local_y));
-        return;
-    }
 
     if (state->drag.kind != POINTER_MOUSE) {
         return;
@@ -1489,16 +2015,15 @@ static void handle_mouse_up(AppState *state, const SDL_MouseButtonEvent *button)
         return;
     }
 
-    if (state->keyboard_press.kind == POINTER_MOUSE) {
-        end_keyboard_press(state);
-        return;
-    }
-
     if (state->drag.kind != POINTER_MOUSE) {
         return;
     }
 
-    end_pointer_interaction(state);
+    end_pointer_interaction(
+        state,
+        ui_x_from_window_x(state, button->x),
+        ui_y_from_window_y(state, button->y)
+    );
 }
 
 static void handle_finger_down(AppState *state, const SDL_TouchFingerEvent *finger) {
@@ -1530,11 +2055,6 @@ static void handle_finger_motion(AppState *state, const SDL_TouchFingerEvent *fi
     local_x = ui_x_from_normalized_x(state, finger->x);
     local_y = ui_y_from_normalized_y(state, finger->y);
 
-    if (state->keyboard_press.kind == POINTER_FINGER && state->keyboard_press.finger_id == finger->fingerID) {
-        update_keyboard_press(state, local_x, local_y);
-        return;
-    }
-
     if (state->drag.kind != POINTER_FINGER || state->drag.finger_id != finger->fingerID) {
         return;
     }
@@ -1547,23 +2067,82 @@ static void handle_finger_motion(AppState *state, const SDL_TouchFingerEvent *fi
 }
 
 static void handle_finger_up(AppState *state, const SDL_TouchFingerEvent *finger) {
-    if (state->keyboard_press.kind == POINTER_FINGER && state->keyboard_press.finger_id == finger->fingerID) {
-        end_keyboard_press(state);
-        return;
-    }
-
     if (state->drag.kind != POINTER_FINGER || state->drag.finger_id != finger->fingerID) {
         return;
     }
 
-    end_pointer_interaction(state);
+    end_pointer_interaction(
+        state,
+        ui_x_from_normalized_x(state, finger->x),
+        ui_y_from_normalized_y(state, finger->y)
+    );
 }
 
 static void SDLCALL on_tray_show_hide(void *userdata, SDL_TrayEntry *entry) {
     AppState *state = (AppState *) userdata;
     (void) entry;
 
-    set_window_visibility(state, !state->visible);
+    if (state->control_mode == CONTROL_MODE_HOTKEY) {
+        return;
+    }
+
+    set_widget_visibility_preference(state, !state->widget_visible);
+}
+
+static void SDLCALL on_tray_control_widget(void *userdata, SDL_TrayEntry *entry) {
+    AppState *state = (AppState *) userdata;
+    (void) entry;
+
+    set_control_mode(state, CONTROL_MODE_WIDGET, true);
+}
+
+static void SDLCALL on_tray_control_hotkey(void *userdata, SDL_TrayEntry *entry) {
+    AppState *state = (AppState *) userdata;
+    (void) entry;
+
+    set_control_mode(state, CONTROL_MODE_HOTKEY, true);
+}
+
+static void SDLCALL on_tray_backend_openai(void *userdata, SDL_TrayEntry *entry) {
+    AppState *state = (AppState *) userdata;
+    (void) entry;
+
+    switch_transcription_backend(state, TB_TRANSCRIPTION_BACKEND_OPENAI);
+}
+
+static void SDLCALL on_tray_backend_npu(void *userdata, SDL_TrayEntry *entry) {
+    AppState *state = (AppState *) userdata;
+    (void) entry;
+
+    switch_transcription_backend(state, TB_TRANSCRIPTION_BACKEND_NPU);
+}
+
+static void SDLCALL on_tray_npu_model_tiny(void *userdata, SDL_TrayEntry *entry) {
+    AppState *state = (AppState *) userdata;
+    (void) entry;
+
+    switch_npu_model(state, "whisper_tiny_en");
+}
+
+static void SDLCALL on_tray_npu_model_base(void *userdata, SDL_TrayEntry *entry) {
+    AppState *state = (AppState *) userdata;
+    (void) entry;
+
+    switch_npu_model(state, "whisper_base_en");
+}
+
+static void SDLCALL on_tray_npu_model_small(void *userdata, SDL_TrayEntry *entry) {
+    AppState *state = (AppState *) userdata;
+    (void) entry;
+
+    switch_npu_model(state, "whisper_small_en");
+}
+
+static void SDLCALL on_tray_npu_model_turbo(void *userdata, SDL_TrayEntry *entry) {
+    AppState *state = (AppState *) userdata;
+    (void) entry;
+
+    switch_npu_model(state, "whisper_large_v3_turbo");
 }
 
 static void SDLCALL on_tray_mode_standard(void *userdata, SDL_TrayEntry *entry) {
@@ -1571,13 +2150,6 @@ static void SDLCALL on_tray_mode_standard(void *userdata, SDL_TrayEntry *entry) 
     (void) entry;
 
     set_mode(state, APP_MODE_STANDARD, true);
-}
-
-static void SDLCALL on_tray_mode_coding(void *userdata, SDL_TrayEntry *entry) {
-    AppState *state = (AppState *) userdata;
-    (void) entry;
-
-    set_mode(state, APP_MODE_CODING, true);
 }
 
 static void SDLCALL on_tray_mode_terminal(void *userdata, SDL_TrayEntry *entry) {
@@ -1635,15 +2207,41 @@ static bool setup_tray(AppState *state) {
     }
 
     state->tray.show_hide = SDL_InsertTrayEntryAt(state->tray.menu, -1, "Hide Button", SDL_TRAYENTRY_BUTTON);
-    state->tray.mode_parent = SDL_InsertTrayEntryAt(state->tray.menu, -1, "Mode", SDL_TRAYENTRY_SUBMENU);
+    state->tray.control_parent = SDL_InsertTrayEntryAt(state->tray.menu, -1, "Control", SDL_TRAYENTRY_SUBMENU);
+    state->tray.backend_parent = SDL_InsertTrayEntryAt(state->tray.menu, -1, "Backend", SDL_TRAYENTRY_SUBMENU);
+    state->tray.npu_model_parent = SDL_InsertTrayEntryAt(state->tray.menu, -1, "NPU Model", SDL_TRAYENTRY_SUBMENU);
+    state->tray.mode_parent = SDL_InsertTrayEntryAt(state->tray.menu, -1, "Prompt", SDL_TRAYENTRY_SUBMENU);
     state->tray.text_parent = SDL_InsertTrayEntryAt(state->tray.menu, -1, "Text", SDL_TRAYENTRY_SUBMENU);
     state->tray.quit = SDL_InsertTrayEntryAt(state->tray.menu, -1, "Quit", SDL_TRAYENTRY_BUTTON);
 
-    if (state->tray.show_hide == NULL || state->tray.mode_parent == NULL || state->tray.text_parent == NULL || state->tray.quit == NULL) {
+    if (
+        state->tray.show_hide == NULL
+        || state->tray.control_parent == NULL
+        || state->tray.backend_parent == NULL
+        || state->tray.npu_model_parent == NULL
+        || state->tray.mode_parent == NULL
+        || state->tray.text_parent == NULL
+        || state->tray.quit == NULL
+    ) {
         SDL_Log("Failed to create tray menu entries");
         return false;
     }
 
+    state->tray.control_menu = SDL_CreateTraySubmenu(state->tray.control_parent);
+    if (state->tray.control_menu == NULL) {
+        SDL_Log("SDL_CreateTraySubmenu failed: %s", SDL_GetError());
+        return false;
+    }
+    state->tray.backend_menu = SDL_CreateTraySubmenu(state->tray.backend_parent);
+    if (state->tray.backend_menu == NULL) {
+        SDL_Log("SDL_CreateTraySubmenu failed: %s", SDL_GetError());
+        return false;
+    }
+    state->tray.npu_model_menu = SDL_CreateTraySubmenu(state->tray.npu_model_parent);
+    if (state->tray.npu_model_menu == NULL) {
+        SDL_Log("SDL_CreateTraySubmenu failed: %s", SDL_GetError());
+        return false;
+    }
     state->tray.mode_menu = SDL_CreateTraySubmenu(state->tray.mode_parent);
     if (state->tray.mode_menu == NULL) {
         SDL_Log("SDL_CreateTraySubmenu failed: %s", SDL_GetError());
@@ -1655,16 +2253,30 @@ static bool setup_tray(AppState *state) {
         return false;
     }
 
+    state->tray.control_widget = SDL_InsertTrayEntryAt(state->tray.control_menu, -1, "Widget", SDL_TRAYENTRY_CHECKBOX);
+    state->tray.control_hotkey = SDL_InsertTrayEntryAt(state->tray.control_menu, -1, "Hotkey", SDL_TRAYENTRY_CHECKBOX);
+    state->tray.backend_openai = SDL_InsertTrayEntryAt(state->tray.backend_menu, -1, "OpenAI", SDL_TRAYENTRY_CHECKBOX);
+    state->tray.backend_npu = SDL_InsertTrayEntryAt(state->tray.backend_menu, -1, "NPU", SDL_TRAYENTRY_CHECKBOX);
+    state->tray.npu_model_tiny = SDL_InsertTrayEntryAt(state->tray.npu_model_menu, -1, "Tiny", SDL_TRAYENTRY_CHECKBOX);
+    state->tray.npu_model_base = SDL_InsertTrayEntryAt(state->tray.npu_model_menu, -1, "Base", SDL_TRAYENTRY_CHECKBOX);
+    state->tray.npu_model_small = SDL_InsertTrayEntryAt(state->tray.npu_model_menu, -1, "Small", SDL_TRAYENTRY_CHECKBOX);
+    state->tray.npu_model_turbo = SDL_InsertTrayEntryAt(state->tray.npu_model_menu, -1, "Large V3 Turbo", SDL_TRAYENTRY_CHECKBOX);
     state->tray.mode_standard = SDL_InsertTrayEntryAt(state->tray.mode_menu, -1, "Standard", SDL_TRAYENTRY_CHECKBOX);
-    state->tray.mode_coding = SDL_InsertTrayEntryAt(state->tray.mode_menu, -1, "Coding", SDL_TRAYENTRY_CHECKBOX);
     state->tray.mode_terminal = SDL_InsertTrayEntryAt(state->tray.mode_menu, -1, "Terminal", SDL_TRAYENTRY_CHECKBOX);
     state->tray.text_surface = SDL_InsertTrayEntryAt(state->tray.text_menu, -1, "Surface", SDL_TRAYENTRY_CHECKBOX);
     state->tray.text_engine = SDL_InsertTrayEntryAt(state->tray.text_menu, -1, "Engine", SDL_TRAYENTRY_CHECKBOX);
     state->tray.text_debug = SDL_InsertTrayEntryAt(state->tray.text_menu, -1, "Debug Logs", SDL_TRAYENTRY_CHECKBOX);
 
     if (
-        state->tray.mode_standard == NULL
-        || state->tray.mode_coding == NULL
+        state->tray.control_widget == NULL
+        || state->tray.control_hotkey == NULL
+        || state->tray.backend_openai == NULL
+        || state->tray.backend_npu == NULL
+        || state->tray.npu_model_tiny == NULL
+        || state->tray.npu_model_base == NULL
+        || state->tray.npu_model_small == NULL
+        || state->tray.npu_model_turbo == NULL
+        || state->tray.mode_standard == NULL
         || state->tray.mode_terminal == NULL
         || state->tray.text_surface == NULL
         || state->tray.text_engine == NULL
@@ -1675,8 +2287,15 @@ static bool setup_tray(AppState *state) {
     }
 
     SDL_SetTrayEntryCallback(state->tray.show_hide, on_tray_show_hide, state);
+    SDL_SetTrayEntryCallback(state->tray.control_widget, on_tray_control_widget, state);
+    SDL_SetTrayEntryCallback(state->tray.control_hotkey, on_tray_control_hotkey, state);
+    SDL_SetTrayEntryCallback(state->tray.backend_openai, on_tray_backend_openai, state);
+    SDL_SetTrayEntryCallback(state->tray.backend_npu, on_tray_backend_npu, state);
+    SDL_SetTrayEntryCallback(state->tray.npu_model_tiny, on_tray_npu_model_tiny, state);
+    SDL_SetTrayEntryCallback(state->tray.npu_model_base, on_tray_npu_model_base, state);
+    SDL_SetTrayEntryCallback(state->tray.npu_model_small, on_tray_npu_model_small, state);
+    SDL_SetTrayEntryCallback(state->tray.npu_model_turbo, on_tray_npu_model_turbo, state);
     SDL_SetTrayEntryCallback(state->tray.mode_standard, on_tray_mode_standard, state);
-    SDL_SetTrayEntryCallback(state->tray.mode_coding, on_tray_mode_coding, state);
     SDL_SetTrayEntryCallback(state->tray.mode_terminal, on_tray_mode_terminal, state);
     SDL_SetTrayEntryCallback(state->tray.text_surface, on_tray_text_surface, state);
     SDL_SetTrayEntryCallback(state->tray.text_engine, on_tray_text_engine, state);
@@ -1699,40 +2318,6 @@ static void destroy_tray(AppState *state) {
     }
 }
 
-static bool build_wav_buffer(const float *samples, int sample_count, Uint8 **out_data, size_t *out_size) {
-    size_t data_size = (size_t) sample_count * sizeof(int16_t);
-    size_t total_size = 44 + data_size;
-    Uint8 *buffer = (Uint8 *) SDL_malloc(total_size);
-    if (buffer == NULL) {
-        return false;
-    }
-
-    SDL_memset(buffer, 0, total_size);
-    SDL_memcpy(buffer, "RIFF", 4);
-    *(uint32_t *) (buffer + 4) = (uint32_t) (36 + data_size);
-    SDL_memcpy(buffer + 8, "WAVE", 4);
-    SDL_memcpy(buffer + 12, "fmt ", 4);
-    *(uint32_t *) (buffer + 16) = 16;
-    *(uint16_t *) (buffer + 20) = 1;
-    *(uint16_t *) (buffer + 22) = 1;
-    *(uint32_t *) (buffer + 24) = AUDIO_SAMPLE_RATE;
-    *(uint32_t *) (buffer + 28) = AUDIO_SAMPLE_RATE * sizeof(int16_t);
-    *(uint16_t *) (buffer + 32) = sizeof(int16_t);
-    *(uint16_t *) (buffer + 34) = 16;
-    SDL_memcpy(buffer + 36, "data", 4);
-    *(uint32_t *) (buffer + 40) = (uint32_t) data_size;
-
-    for (int index = 0; index < sample_count; ++index) {
-        float clamped = SDL_clamp(samples[index], -1.0f, 1.0f);
-        int16_t pcm = (int16_t) (clamped * 32767.0f);
-        *(int16_t *) (buffer + 44 + (index * (int) sizeof(int16_t))) = pcm;
-    }
-
-    *out_data = buffer;
-    *out_size = total_size;
-    return true;
-}
-
 #ifdef _WIN32
 static HWND get_app_hwnd(AppState *state) {
     if (state->app_hwnd == NULL && state->window != NULL) {
@@ -1740,6 +2325,67 @@ static HWND get_app_hwnd(AppState *state) {
         state->app_hwnd = (HWND) SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
     }
     return state->app_hwnd;
+}
+
+static bool SDLCALL windows_message_hook(void *userdata, MSG *msg) {
+    AppState *state = (AppState *) userdata;
+    SDL_Event event;
+
+    if (state == NULL || msg == NULL) {
+        return true;
+    }
+
+    if (msg->message != WM_HOTKEY || (int) msg->wParam != TB_GLOBAL_HOTKEY_ID) {
+        return true;
+    }
+
+    if (state->hotkey_event_type == 0 || state->hotkey_event_type == (Uint32) -1) {
+        return false;
+    }
+
+    SDL_zero(event);
+    event.type = state->hotkey_event_type;
+    SDL_PushEvent(&event);
+    return false;
+}
+
+static bool update_hotkey_registration(AppState *state) {
+    bool should_register = false;
+
+    if (state == NULL) {
+        return false;
+    }
+
+    should_register = state->control_mode == CONTROL_MODE_HOTKEY;
+    if (!should_register) {
+        if (state->hotkey_registered) {
+            UnregisterHotKey(NULL, TB_GLOBAL_HOTKEY_ID);
+            state->hotkey_registered = false;
+        }
+        return true;
+    }
+
+    if (state->hotkey_registered) {
+        return true;
+    }
+
+    if (!RegisterHotKey(NULL, TB_GLOBAL_HOTKEY_ID, TB_GLOBAL_HOTKEY_MODIFIERS, TB_GLOBAL_HOTKEY_VKEY)) {
+        transcription_set_ui(
+            state,
+            false,
+            true,
+            false,
+            "HOTKEY UNAVAILABLE",
+            "Ctrl+Alt+Space is already in use by another app."
+        );
+        resize_for_mode(state);
+        apply_window_visibility_policy(state);
+        request_redraw(state);
+        return false;
+    }
+
+    state->hotkey_registered = true;
+    return true;
 }
 
 static void update_last_external_window(AppState *state) {
@@ -1778,6 +2424,25 @@ static bool window_process_is_windows_terminal(HWND window) {
     basename = wcsrchr(path, L'\\');
     basename = (basename != NULL) ? basename + 1 : path;
     return _wcsicmp(basename, L"WindowsTerminal.exe") == 0;
+}
+
+static HWND resolve_injection_target_hwnd(const AppState *state) {
+    HWND target = NULL;
+
+    if (state == NULL) {
+        return NULL;
+    }
+
+    target = state->injection_target_hwnd;
+    if (target == NULL || !IsWindow(target)) {
+        target = state->last_external_hwnd;
+    }
+
+    if (target == NULL || !IsWindow(target)) {
+        return NULL;
+    }
+
+    return target;
 }
 
 static bool focus_window_best_effort(HWND target) {
@@ -1860,17 +2525,34 @@ static bool send_paste_shortcut(HWND target) {
     return SendInput(count, inputs, sizeof(INPUT)) == count;
 }
 
-static bool try_inject_transcript(AppState *state, const char *transcript) {
-    HWND target = state->injection_target_hwnd;
+static bool send_virtual_key(WORD virtual_key) {
+    INPUT inputs[2];
 
-    if (transcript == NULL || transcript[0] == '\0') {
+    SDL_zeroa(inputs);
+
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = virtual_key;
+
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = virtual_key;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    return SendInput(SDL_arraysize(inputs), inputs, sizeof(INPUT)) == SDL_arraysize(inputs);
+}
+
+static bool injection_target_is_windows_terminal(const AppState *state) {
+    HWND target = resolve_injection_target_hwnd(state);
+
+    return target != NULL && window_process_is_windows_terminal(target);
+}
+
+static bool try_inject_transcript(AppState *state, const char *transcript) {
+    HWND target = resolve_injection_target_hwnd(state);
+
+    if (target == NULL || !IsWindow(target)) {
         return false;
     }
-
-    if (target == NULL || !IsWindow(target)) {
-        target = state->last_external_hwnd;
-    }
-    if (target == NULL || !IsWindow(target)) {
+    if (transcript == NULL || transcript[0] == '\0') {
         return false;
     }
 
@@ -1885,7 +2567,27 @@ static bool try_inject_transcript(AppState *state, const char *transcript) {
     SDL_Delay(80);
     return send_paste_shortcut(target);
 }
+
+static bool try_submit_terminal_target(AppState *state) {
+    HWND target = resolve_injection_target_hwnd(state);
+
+    if (target == NULL || !window_process_is_windows_terminal(target)) {
+        return false;
+    }
+
+    if (!focus_window_best_effort(target)) {
+        return false;
+    }
+
+    SDL_Delay(40);
+    return send_virtual_key(VK_RETURN);
+}
 #else
+static bool update_hotkey_registration(AppState *state) {
+    (void) state;
+    return true;
+}
+
 static void update_last_external_window(AppState *state) {
     (void) state;
 }
@@ -1895,255 +2597,14 @@ static bool try_inject_transcript(AppState *state, const char *transcript) {
     (void) transcript;
     return false;
 }
-#endif
 
-#ifdef _WIN32
-static wchar_t *utf8_to_wide(const char *text) {
-    int required = 0;
-    wchar_t *buffer = NULL;
-
-    required = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
-    if (required <= 0) {
-        return NULL;
-    }
-
-    buffer = (wchar_t *) SDL_malloc((size_t) required * sizeof(wchar_t));
-    if (buffer == NULL) {
-        return NULL;
-    }
-
-    if (MultiByteToWideChar(CP_UTF8, 0, text, -1, buffer, required) <= 0) {
-        SDL_free(buffer);
-        return NULL;
-    }
-
-    return buffer;
+static bool injection_target_is_windows_terminal(const AppState *state) {
+    (void) state;
+    return false;
 }
 
-static char *format_winhttp_error(const char *prefix) {
-    char *message = NULL;
-    DWORD code = GetLastError();
-    SDL_asprintf(&message, "%s (WinHTTP error %lu)", prefix, (unsigned long) code);
-    return message;
-}
-
-static bool read_winhttp_response(HINTERNET request, char **out_text) {
-    char *buffer = NULL;
-    size_t used = 0;
-
-    for (;;) {
-        DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(request, &available)) {
-            SDL_free(buffer);
-            return false;
-        }
-
-        if (available == 0) {
-            break;
-        }
-
-        char *grown = (char *) SDL_realloc(buffer, used + (size_t) available + 1);
-        if (grown == NULL) {
-            SDL_free(buffer);
-            return false;
-        }
-        buffer = grown;
-
-        DWORD read = 0;
-        if (!WinHttpReadData(request, buffer + used, available, &read)) {
-            SDL_free(buffer);
-            return false;
-        }
-
-        used += read;
-    }
-
-    if (buffer == NULL) {
-        buffer = (char *) SDL_malloc(1);
-        if (buffer == NULL) {
-            return false;
-        }
-        buffer[0] = '\0';
-    } else {
-        buffer[used] = '\0';
-    }
-
-    *out_text = buffer;
-    return true;
-}
-
-static bool send_transcription_request(
-    const char *api_key,
-    const char *model,
-    const char *prompt,
-    const Uint8 *wav_data,
-    size_t wav_size,
-    char **out_text,
-    char **out_error
-) {
-    const char *boundary = "----terminalbuddyboundary7MA4YWxkTrZu0gW";
-    char *prefix = NULL;
-    char *suffix = NULL;
-    char *headers = NULL;
-    wchar_t *headers_wide = NULL;
-    Uint8 *body = NULL;
-    size_t prefix_len = 0;
-    size_t suffix_len = 0;
-    size_t total_len = 0;
-    HINTERNET session = NULL;
-    HINTERNET connect = NULL;
-    HINTERNET request = NULL;
-    DWORD status_code = 0;
-    DWORD status_size = sizeof(status_code);
-    bool success = false;
-
-    if (SDL_asprintf(
-            &prefix,
-            "--%s\r\n"
-            "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
-            "%s\r\n"
-            "--%s\r\n"
-            "Content-Disposition: form-data; name=\"response_format\"\r\n\r\n"
-            "text\r\n"
-            "--%s\r\n"
-            "Content-Disposition: form-data; name=\"prompt\"\r\n\r\n"
-            "%s\r\n"
-            "--%s\r\n"
-            "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n"
-            "Content-Type: audio/wav\r\n\r\n",
-            boundary,
-            model,
-            boundary,
-            boundary,
-            prompt,
-            boundary
-        ) < 0) {
-        *out_error = SDL_strdup("Failed to allocate multipart prefix");
-        goto cleanup;
-    }
-
-    if (SDL_asprintf(&suffix, "\r\n--%s--\r\n", boundary) < 0) {
-        *out_error = SDL_strdup("Failed to allocate multipart suffix");
-        goto cleanup;
-    }
-
-    prefix_len = SDL_strlen(prefix);
-    suffix_len = SDL_strlen(suffix);
-    total_len = prefix_len + wav_size + suffix_len;
-
-    body = (Uint8 *) SDL_malloc(total_len);
-    if (body == NULL) {
-        *out_error = SDL_strdup("Failed to allocate multipart body");
-        goto cleanup;
-    }
-
-    SDL_memcpy(body, prefix, prefix_len);
-    SDL_memcpy(body + prefix_len, wav_data, wav_size);
-    SDL_memcpy(body + prefix_len + wav_size, suffix, suffix_len);
-
-    if (SDL_asprintf(
-            &headers,
-            "Authorization: Bearer %s\r\nContent-Type: multipart/form-data; boundary=%s\r\n",
-            api_key,
-            boundary
-        ) < 0) {
-        *out_error = SDL_strdup("Failed to allocate request headers");
-        goto cleanup;
-    }
-
-    headers_wide = utf8_to_wide(headers);
-    if (headers_wide == NULL) {
-        *out_error = SDL_strdup("Failed to convert request headers");
-        goto cleanup;
-    }
-
-    session = WinHttpOpen(L"terminal-buddy/0.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (session == NULL) {
-        *out_error = format_winhttp_error("WinHttpOpen failed");
-        goto cleanup;
-    }
-
-    connect = WinHttpConnect(session, L"api.openai.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (connect == NULL) {
-        *out_error = format_winhttp_error("WinHttpConnect failed");
-        goto cleanup;
-    }
-
-    request = WinHttpOpenRequest(connect, L"POST", L"/v1/audio/transcriptions", NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    if (request == NULL) {
-        *out_error = format_winhttp_error("WinHttpOpenRequest failed");
-        goto cleanup;
-    }
-
-    if (!WinHttpAddRequestHeaders(request, headers_wide, (DWORD) -1L, WINHTTP_ADDREQ_FLAG_ADD)) {
-        *out_error = format_winhttp_error("WinHttpAddRequestHeaders failed");
-        goto cleanup;
-    }
-
-    if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, body, (DWORD) total_len, (DWORD) total_len, 0)) {
-        *out_error = format_winhttp_error("WinHttpSendRequest failed");
-        goto cleanup;
-    }
-
-    if (!WinHttpReceiveResponse(request, NULL)) {
-        *out_error = format_winhttp_error("WinHttpReceiveResponse failed");
-        goto cleanup;
-    }
-
-    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &status_size, WINHTTP_NO_HEADER_INDEX)) {
-        *out_error = format_winhttp_error("WinHttpQueryHeaders failed");
-        goto cleanup;
-    }
-
-    if (!read_winhttp_response(request, out_text)) {
-        *out_error = format_winhttp_error("Failed to read response");
-        goto cleanup;
-    }
-
-    trim_newlines(*out_text);
-    if (status_code < 200 || status_code >= 300) {
-        SDL_asprintf(out_error, "OpenAI returned HTTP %lu: %s", (unsigned long) status_code, *out_text);
-        SDL_free(*out_text);
-        *out_text = NULL;
-        goto cleanup;
-    }
-
-    success = true;
-
-cleanup:
-    if (request != NULL) {
-        WinHttpCloseHandle(request);
-    }
-    if (connect != NULL) {
-        WinHttpCloseHandle(connect);
-    }
-    if (session != NULL) {
-        WinHttpCloseHandle(session);
-    }
-    SDL_free(headers_wide);
-    SDL_free(headers);
-    SDL_free(body);
-    SDL_free(prefix);
-    SDL_free(suffix);
-    return success;
-}
-#else
-static bool send_transcription_request(
-    const char *api_key,
-    const char *model,
-    const char *prompt,
-    const Uint8 *wav_data,
-    size_t wav_size,
-    char **out_text,
-    char **out_error
-) {
-    (void) api_key;
-    (void) model;
-    (void) prompt;
-    (void) wav_data;
-    (void) wav_size;
-    (void) out_text;
-    *out_error = SDL_strdup("OpenAI transcription is only wired for Windows in this scaffold.");
+static bool try_submit_terminal_target(AppState *state) {
+    (void) state;
     return false;
 }
 #endif
@@ -2151,23 +2612,34 @@ static bool send_transcription_request(
 static int transcription_worker(void *userdata) {
     TranscriptionJob *job = (TranscriptionJob *) userdata;
     AppState *state = job->app;
-    Uint8 *wav_data = NULL;
-    size_t wav_size = 0;
     char *response_text = NULL;
     char *error_text = NULL;
-    const char *prompt = mode_prompt(job->mode);
+    char metrics_text[MAX_METRICS_TEXT];
+    TbTranscriptionRequest request;
+    TbTranscriptionNpuTimingStats timing_stats;
 
-    if (!build_wav_buffer(job->samples, job->sample_count, &wav_data, &wav_size)) {
-        error_text = SDL_strdup("Failed to build WAV payload");
-    } else if (!send_transcription_request(job->api_key, job->model, prompt, wav_data, wav_size, &response_text, &error_text)) {
+    SDL_zeroa(metrics_text);
+    SDL_zero(timing_stats);
+
+    request.samples = job->samples;
+    request.sample_count = job->sample_count;
+    request.sample_rate = AUDIO_SAMPLE_RATE;
+    request.prompt = mode_prompt(job->mode);
+
+    if (!tb_transcription_execute(&job->config, &request, &response_text, &error_text)) {
         if (error_text == NULL) {
             error_text = SDL_strdup("Transcription request failed");
         }
     }
 
+    if (tb_transcription_backend_npu_get_last_timing_stats(&timing_stats)) {
+        format_transcription_metrics_text(&job->config, &timing_stats, metrics_text, sizeof(metrics_text));
+    }
+
     SDL_LockMutex(state->transcription.mutex);
     state->transcription.processing = false;
     state->transcription.show_feedback = true;
+    state->transcription.terminal_submit_ready = false;
     state->transcription.worker_done = true;
     if (response_text != NULL) {
         SDL_snprintf(state->transcription.status_text, sizeof(state->transcription.status_text), "%s", "TRANSCRIPT READY");
@@ -2177,14 +2649,12 @@ static int transcription_worker(void *userdata) {
         SDL_snprintf(state->transcription.status_text, sizeof(state->transcription.status_text), "%s", "TRANSCRIPTION FAILED");
         SDL_snprintf(state->transcription.transcript_text, sizeof(state->transcription.transcript_text), "%s", error_text != NULL ? error_text : "Unknown error");
     }
+    SDL_snprintf(state->transcription.metrics_text, sizeof(state->transcription.metrics_text), "%s", metrics_text);
     SDL_UnlockMutex(state->transcription.mutex);
 
     SDL_free(response_text);
     SDL_free(error_text);
-    SDL_free(wav_data);
     SDL_free(job->samples);
-    SDL_free(job->api_key);
-    SDL_free(job->model);
     SDL_free(job);
     return 0;
 }
@@ -2193,17 +2663,18 @@ static bool begin_transcription(AppState *state) {
     TranscriptionJob *job = NULL;
     float *sample_copy = NULL;
 
-    reload_dev_env(state);
-    if (!state->transcription.api_ready) {
+    reload_transcription_config(state);
+    if (!state->transcription.config.ready) {
         transcription_set_ui(
             state,
             false,
             true,
             false,
-            "OPENAI KEY MISSING",
-            "Create .env/dev.env and set OPENAI_API_KEY=... then record again."
+            state->transcription.config.missing_status,
+            state->transcription.config.missing_detail
         );
         resize_for_mode(state);
+        apply_window_visibility_policy(state);
         return false;
     }
 
@@ -2217,6 +2688,7 @@ static bool begin_transcription(AppState *state) {
             "The mic stream did not deliver any samples."
         );
         resize_for_mode(state);
+        apply_window_visibility_policy(state);
         return false;
     }
 
@@ -2242,6 +2714,7 @@ static bool begin_transcription(AppState *state) {
             "Could not copy captured audio for transcription."
         );
         resize_for_mode(state);
+        apply_window_visibility_policy(state);
         return false;
     }
     SDL_memcpy(sample_copy, state->audio.captured_samples, sizeof(float) * (size_t) state->audio.captured_count);
@@ -2258,6 +2731,7 @@ static bool begin_transcription(AppState *state) {
             "Could not allocate transcription job."
         );
         resize_for_mode(state);
+        apply_window_visibility_policy(state);
         return false;
     }
 
@@ -2265,39 +2739,21 @@ static bool begin_transcription(AppState *state) {
     job->samples = sample_copy;
     job->sample_count = state->audio.captured_count;
     job->mode = state->mode;
-    job->api_key = SDL_strdup(state->transcription.api_key);
-    job->model = SDL_strdup(state->transcription.model);
-
-    if (job->api_key == NULL || job->model == NULL) {
-        SDL_free(job->api_key);
-        SDL_free(job->model);
-        SDL_free(job->samples);
-        SDL_free(job);
-        transcription_set_ui(
-            state,
-            false,
-            true,
-            false,
-            "ALLOC FAILED",
-            "Could not prepare transcription credentials."
-        );
-        resize_for_mode(state);
-        return false;
-    }
+    job->config = state->transcription.config;
 
     SDL_LockMutex(state->transcription.mutex);
     state->transcription.processing = true;
     state->transcription.worker_done = false;
     state->transcription.show_feedback = true;
     state->transcription.clipboard_dirty = false;
+    state->transcription.terminal_submit_ready = false;
     SDL_snprintf(state->transcription.status_text, sizeof(state->transcription.status_text), "%s", "TRANSCRIBING");
     state->transcription.transcript_text[0] = '\0';
+    state->transcription.metrics_text[0] = '\0';
     SDL_UnlockMutex(state->transcription.mutex);
 
     state->transcription.worker = SDL_CreateThread(transcription_worker, "transcription-worker", job);
     if (state->transcription.worker == NULL) {
-        SDL_free(job->api_key);
-        SDL_free(job->model);
         SDL_free(job->samples);
         SDL_free(job);
         transcription_set_ui(
@@ -2309,21 +2765,18 @@ static bool begin_transcription(AppState *state) {
             SDL_GetError()
         );
         resize_for_mode(state);
+        apply_window_visibility_policy(state);
         return false;
     }
 
     resize_for_mode(state);
+    apply_window_visibility_policy(state);
     return true;
 }
 
 static void handle_panel_tap(AppState *state) {
     bool processing = false;
     bool show_feedback = false;
-
-    if (state->keyboard_visible) {
-        hide_keyboard(state);
-        return;
-    }
 
     SDL_LockMutex(state->transcription.mutex);
     processing = state->transcription.processing;
@@ -2337,7 +2790,6 @@ static void handle_panel_tap(AppState *state) {
     if (state->listening) {
         stop_listening(state);
         begin_transcription(state);
-        resize_for_mode(state);
         return;
     }
 
@@ -2349,9 +2801,19 @@ static void handle_panel_tap(AppState *state) {
     start_listening(state);
 }
 
+static void handle_hotkey_action(AppState *state) {
+    if (state == NULL || state->control_mode != CONTROL_MODE_HOTKEY) {
+        return;
+    }
+
+    update_last_external_window(state);
+    handle_panel_tap(state);
+}
+
 static void pump_transcription_results(AppState *state) {
     bool should_reap = false;
     bool should_copy = false;
+    bool terminal_submit_ready = false;
     char transcript[MAX_TRANSCRIPT_TEXT];
     bool injected = false;
 
@@ -2365,13 +2827,15 @@ static void pump_transcription_results(AppState *state) {
     SDL_UnlockMutex(state->transcription.mutex);
 
     if (should_copy && transcript[0] != '\0') {
+        terminal_submit_ready = state->mode == APP_MODE_TERMINAL && injection_target_is_windows_terminal(state);
         injected = try_inject_transcript(state, transcript);
         SDL_LockMutex(state->transcription.mutex);
+        state->transcription.terminal_submit_ready = terminal_submit_ready && injected;
         SDL_snprintf(
             state->transcription.status_text,
             sizeof(state->transcription.status_text),
             "%s",
-            injected ? "PASTED TO TARGET" : "TRANSCRIPT READY"
+            (terminal_submit_ready && injected) ? "PASTED TO TERMINAL" : (injected ? "PASTED TO TARGET" : "TRANSCRIPT READY")
         );
         SDL_UnlockMutex(state->transcription.mutex);
         request_redraw(state);
@@ -2402,6 +2866,8 @@ static void destroy_transcription_state(AppState *state) {
         state->transcription.worker = NULL;
     }
 
+    tb_transcription_backend_npu_shutdown();
+
     if (state->transcription.mutex != NULL) {
         SDL_DestroyMutex(state->transcription.mutex);
         state->transcription.mutex = NULL;
@@ -2418,9 +2884,8 @@ int main(void) {
     state.running = true;
     state.visible = true;
     state.needs_redraw = true;
+    state.perf_logging_enabled = perf_logging_from_env();
     state.transcription.mutex = SDL_CreateMutex();
-    clear_keyboard_press(&state);
-    tb_keyboard_mod_init(&state.keyboard_mods);
 
     if (state.transcription.mutex == NULL) {
         return fail("SDL_CreateMutex failed");
@@ -2434,9 +2899,14 @@ int main(void) {
     g_log_mutex = SDL_CreateMutex();
     SDL_GetLogOutputFunction(&g_default_log_output, &g_default_log_userdata);
     SDL_SetLogOutputFunction(terminal_buddy_log_output, NULL);
+    state.perf_counter_freq = SDL_GetPerformanceFrequency();
+    state.hotkey_event_type = SDL_RegisterEvents(1);
+    if (state.hotkey_event_type == (Uint32) -1) {
+        state.hotkey_event_type = 0;
+    }
 
     load_preferences(&state);
-    reload_dev_env(&state);
+    reload_transcription_config(&state);
 
     state.window = SDL_CreateWindow(
         "terminal-buddy",
@@ -2471,19 +2941,28 @@ int main(void) {
     SDL_SetWindowFocusable(state.window, false);
     sync_window_metrics(&state);
     resize_for_mode(&state);
+    clamp_window_to_display(&state);
 #ifdef _WIN32
     state.app_hwnd = get_app_hwnd(&state);
+    SDL_SetWindowsMessageHook(windows_message_hook, &state);
+    if (!update_hotkey_registration(&state)) {
+        state.control_mode = CONTROL_MODE_WIDGET;
+    }
 #endif
 
     tb_ui_set_text_render_mode(state.text_render_mode);
     tb_ui_set_text_debug_logging(state.text_debug_logging);
     set_log_capture_enabled(state.text_debug_logging);
+    setup_perf_logging(&state);
 
     initialize_audio(&state);
 
     if (!setup_tray(&state)) {
         SDL_Log("Continuing without tray integration");
     }
+
+    apply_window_visibility_policy(&state);
+    refresh_shell_state(&state);
 
     while (state.running) {
         bool processing = false;
@@ -2493,6 +2972,11 @@ int main(void) {
         Uint32 sleep_ms = 50;
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
+            if (event.type == state.hotkey_event_type) {
+                handle_hotkey_action(&state);
+                continue;
+            }
+
             switch (event.type) {
                 case SDL_EVENT_QUIT:
                     state.running = false;
@@ -2503,14 +2987,26 @@ int main(void) {
                     }
                     break;
                 case SDL_EVENT_WINDOW_EXPOSED:
+                    if (state.drag_perf.active) {
+                        state.drag_perf.window_exposed_count += 1;
+                    }
+                    if (!state.drag.dragging) {
+                        request_redraw(&state);
+                    }
+                    break;
+                case SDL_EVENT_WINDOW_MOVED:
+                    sync_window_position_from_os(&state);
+                    break;
                 case SDL_EVENT_WINDOW_RESIZED:
                 case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
                     sync_window_metrics(&state);
+                    clamp_window_to_display(&state);
                     request_redraw(&state);
                     break;
                 case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
                     sync_window_metrics(&state);
                     resize_for_mode(&state);
+                    clamp_window_to_display(&state);
                     request_redraw(&state);
                     break;
                 case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -2539,20 +3035,22 @@ int main(void) {
 
         update_last_external_window(&state);
         update_audio_meter(&state);
-        pump_bubble_long_press(&state);
-        pump_keyboard_repeat(&state);
         pump_transcription_results(&state);
 
         processing = ui_is_processing(&state);
-        animated = state.listening || processing || state.drag.pressed;
+        animated = (state.listening || processing) && !state.drag.dragging;
         now_ms = SDL_GetTicks();
+
+        if (!processing) {
+            tb_transcription_backend_npu_pump(now_ms, state.transcription.config.npu_cache_idle_ms);
+        }
 
         if (state.visible) {
             if (animated && (now_ms - state.last_render_ms >= frame_interval_ms)) {
                 request_redraw(&state);
             }
 
-            if (state.needs_redraw) {
+            if (state.needs_redraw && !state.drag.dragging) {
                 render(&state);
             }
         } else {
@@ -2560,9 +3058,7 @@ int main(void) {
         }
 
         if (state.visible) {
-            if (state.keyboard_press.pressed) {
-                sleep_ms = 8;
-            } else if (state.drag.pressed) {
+            if (state.drag.pressed) {
                 sleep_ms = 8;
             } else if (animated) {
                 Uint64 elapsed_ms = now_ms - state.last_render_ms;
@@ -2584,11 +3080,20 @@ int main(void) {
         stop_listening(&state);
     }
 
+#ifdef _WIN32
+    SDL_SetWindowsMessageHook(NULL, NULL);
+    if (state.hotkey_registered) {
+        UnregisterHotKey(NULL, TB_GLOBAL_HOTKEY_ID);
+        state.hotkey_registered = false;
+    }
+#endif
+
     save_preferences(&state);
     destroy_tray(&state);
     destroy_audio(&state);
     destroy_transcription_state(&state);
     tb_ui_shutdown();
+    shutdown_perf_logging();
 
     if (state.prefs_path != NULL) {
         SDL_free(state.prefs_path);

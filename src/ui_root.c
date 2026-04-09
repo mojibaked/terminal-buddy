@@ -26,9 +26,7 @@ void tb_ui_build_layout(const TbUiModel *model) {
             }
         }
     }) {
-        if (model->scene == TB_UI_SCENE_KEYBOARD) {
-            tb_ui_build_keyboard_shell(model);
-        } else if (model->scene == TB_UI_SCENE_IDLE) {
+        if (model->scene == TB_UI_SCENE_IDLE) {
             tb_ui_build_idle_shell(model);
         } else {
             tb_ui_build_expanded_shell(model);

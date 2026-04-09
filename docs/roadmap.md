@@ -6,7 +6,7 @@ Build a lightweight Windows 11 assistant focused on:
 
 - touch-friendly floating record button
 - low-latency speech-to-text
-- mode-aware cleanup for terminal and coding workflows
+- mode-aware cleanup for general dictation and terminal workflows
 - final text insertion into Windows Terminal
 
 ## Phase 0: Repo Scaffold
@@ -35,7 +35,7 @@ Exit criteria:
 ## Phase 2: Tray + Modes
 
 - add tray icon and context menu
-- expose `standard`, `coding`, and `terminal` modes
+- expose `standard` and `terminal` modes
 - persist window position and selected mode
 
 Exit criteria:
@@ -75,7 +75,7 @@ Exit criteria:
 Exit criteria:
 
 - `terminal` mode preserves shell syntax
-- `coding` mode preserves technical vocabulary
+- `standard` mode stays light-touch for general dictation
 
 ## Notes
 

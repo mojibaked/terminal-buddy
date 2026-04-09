@@ -196,3 +196,21 @@ bool tb_ui_render(const TbUiModel *model) {
     SDL_RenderPresent(g_ui.renderer_data.renderer);
     return true;
 }
+
+bool tb_ui_primary_action_contains(float x, float y) {
+    Clay_ElementData data;
+
+    if (!g_ui.ready) {
+        return false;
+    }
+
+    data = Clay_GetElementData(Clay_GetElementId(CLAY_STRING("FeedbackPrimaryAction")));
+    if (!data.found) {
+        return false;
+    }
+
+    return x >= data.boundingBox.x
+        && y >= data.boundingBox.y
+        && x <= (data.boundingBox.x + data.boundingBox.width)
+        && y <= (data.boundingBox.y + data.boundingBox.height);
+}

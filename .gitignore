@@ -24,3 +24,13 @@ CMakeUserPresets.json
 
 # Logs
 logs/
+_qnn.log
+
+# Local Python export env
+.venv-qai/
+
+# Local NPU runtime / model staging
+runtime/npu/
+models/whisper_qnn/
+export_assets/
+Recording.m4a

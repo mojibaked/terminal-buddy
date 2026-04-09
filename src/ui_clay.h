@@ -6,8 +6,6 @@
 
 #include <SDL3/SDL.h>
 
-#include "keyboard_layout.h"
-
 typedef enum TbUiTextRenderMode {
     TB_UI_TEXT_RENDER_SURFACE = 0,
     TB_UI_TEXT_RENDER_ENGINE
@@ -17,8 +15,7 @@ typedef enum TbUiScene {
     TB_UI_SCENE_IDLE = 0,
     TB_UI_SCENE_LISTENING,
     TB_UI_SCENE_PROCESSING,
-    TB_UI_SCENE_FEEDBACK,
-    TB_UI_SCENE_KEYBOARD
+    TB_UI_SCENE_FEEDBACK
 } TbUiScene;
 
 typedef struct TbUiModel {
@@ -33,12 +30,11 @@ typedef struct TbUiModel {
     const float *audio_history;
     int audio_history_count;
     const char *mode_label;
+    const char *backend_label;
     const char *status_text;
+    const char *metrics_text;
     const char *transcript_text;
-    const TbKeyboardLayoutResult *keyboard_layout;
-    const TbKeyboardModState *keyboard_mods;
-    const char (*keyboard_labels)[8];
-    int keyboard_pressed_key;
+    const char *primary_action_label;
 } TbUiModel;
 
 bool tb_ui_init(SDL_Renderer *renderer);
@@ -48,5 +44,6 @@ TbUiTextRenderMode tb_ui_get_text_render_mode(void);
 void tb_ui_set_text_debug_logging(bool enabled);
 bool tb_ui_get_text_debug_logging(void);
 bool tb_ui_render(const TbUiModel *model);
+bool tb_ui_primary_action_contains(float x, float y);
 
 #endif
