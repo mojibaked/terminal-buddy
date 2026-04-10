@@ -1,12 +1,19 @@
 # terminal-buddy
 
-Minimal native scaffold for a Windows-first dictation companion that targets Windows Terminal.
+Minimal native scaffold for a Windows-first dictation companion that now owns
+its own terminal window as the manual-override surface.
+
+The terminal window is still borrowed from the latest `winterm` UI stack, but
+it now runs in-process inside `terminal-buddy.exe` instead of being launched as
+a separate companion app.
 
 ## Current scope
 
 - `C` project with `CMake`
 - `SDL3` via `FetchContent`
 - Tiny starter window that hints at the eventual floating control + transcript overlay
+- Optional in-process terminal window plus an optional standalone terminal
+  companion executable, both using the sibling `winterm` + `strata` stack
 
 ## Build
 
@@ -26,6 +33,48 @@ For single-config generators such as Ninja, the executable is usually at:
 ```powershell
 .\build\terminal-buddy.exe
 ```
+
+To enable the owned terminal window path, configure with:
+
+```powershell
+cmake -S . -B build -DTERMINAL_BUDDY_BUILD_TERMINAL_UI=ON
+cmake --build build --target terminal-buddy
+```
+
+That same flag also keeps the standalone companion target available:
+
+```powershell
+cmake --build build --target terminal-buddy-terminal
+```
+
+Then run:
+
+```powershell
+.\build\Debug\terminal-buddy-terminal.exe
+```
+
+When built with `TERMINAL_BUDDY_BUILD_TERMINAL_UI=ON`, the Buddy widget exposes
+a left-side `term` button. That button now opens or refocuses Buddy's owned
+terminal window inside the same `terminal-buddy.exe` process and switches Buddy
+into terminal dictation mode.
+
+If the owned window path is unavailable at runtime, Buddy still falls back to
+launching the standalone `terminal-buddy-terminal.exe` companion.
+
+What to test in the owned terminal window:
+
+- open a few tabs and confirm tab switching / close behavior works
+- run normal shell commands directly when Buddy would otherwise get stuck
+- keep the terminal window open beside the floating Buddy app as a manual override
+- confirm the `term` button does not spawn a separate `terminal-buddy-terminal.exe`
+  process when the owned window path is built in
+
+Optional debug hooks for the borrowed `winterm` UI:
+
+- `WINTERM_STRATA_MEMORY_LOG_PATH=C:\path\to\memory-log.csv`
+- `WINTERM_SPEECH_LOG_PATH=C:\path\to\speech-log.jsonl`
+- `WINTERM_SPEECH_DEBUG=1` to mirror speech events to stderr
+- `WINTERM_AUTOMATION_INBOX=C:\path\to\inbox.txt` to inject text into the active tab
 
 ## Transcription Backends
 
@@ -96,10 +145,10 @@ The probe prints the resolved install root, runtime/package paths, runs a real t
 
 ## Next steps
 
-1. Replace the placeholder window with a draggable always-on-top touch button.
-2. Add tray support and a tiny mode menu.
-3. Capture microphone audio.
-4. Stream realtime transcription.
-5. Paste finalized text into Windows Terminal.
+The product direction is now broader than dictation-only terminal insertion.
 
-More detail lives in [docs/roadmap.md](docs/roadmap.md).
+Key docs:
+
+- [docs/product-architecture.md](docs/product-architecture.md)
+- [docs/roadmap.md](docs/roadmap.md)
+- [docs/managed-terminal-integration.md](docs/managed-terminal-integration.md)

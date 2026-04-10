@@ -125,10 +125,13 @@ void tb_ui_build_expanded_shell(const TbUiModel *model) {
     }) {
         CLAY(CLAY_ID("ShellButtonRail"), {
             .layout = {
-                .sizing = { CLAY_SIZING_FIXED(tb_ui_scale_value(model, 92)), CLAY_SIZING_GROW(0) },
+                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                .sizing = { CLAY_SIZING_FIXED(tb_ui_scale_value(model, 150)), CLAY_SIZING_GROW(0) },
+                .childGap = tb_ui_scale_u16(model, 10),
                 .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
             }
         }) {
+            tb_ui_build_terminal_button(model);
             tb_ui_build_button(model, active);
         }
 

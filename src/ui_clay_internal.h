@@ -9,7 +9,10 @@
 #define TB_UI_FONT_ID_BODY 0
 #define TB_UI_BUTTON_SIZE 76
 #define TB_UI_BUTTON_GLOW_SIZE 84
-#define TB_UI_SHELL_WIDTH 348
+#define TB_UI_IDLE_SHELL_WIDTH 164
+#define TB_UI_IDLE_SHELL_HEIGHT 96
+#define TB_UI_TERMINAL_BUTTON_SIZE 54
+#define TB_UI_SHELL_WIDTH 412
 #define TB_UI_SHELL_HEIGHT 112
 #define TB_UI_SHELL_RADIUS 50
 
@@ -63,6 +66,18 @@ static inline float tb_ui_shell_width(const TbUiModel *model) {
     return tb_ui_scale_value(model, TB_UI_SHELL_WIDTH);
 }
 
+static inline float tb_ui_idle_shell_width(const TbUiModel *model) {
+    return tb_ui_scale_value(model, TB_UI_IDLE_SHELL_WIDTH);
+}
+
+static inline float tb_ui_idle_shell_height(const TbUiModel *model) {
+    return tb_ui_scale_value(model, TB_UI_IDLE_SHELL_HEIGHT);
+}
+
+static inline float tb_ui_terminal_button_size(const TbUiModel *model) {
+    return tb_ui_scale_value(model, TB_UI_TERMINAL_BUTTON_SIZE);
+}
+
 static inline float tb_ui_shell_height(const TbUiModel *model) {
     return tb_ui_scale_value(model, TB_UI_SHELL_HEIGHT);
 }
@@ -101,6 +116,7 @@ static inline Clay_Color tb_ui_active_glow(void) {
 }
 
 void tb_ui_build_button(const TbUiModel *model, bool active);
+void tb_ui_build_terminal_button(const TbUiModel *model);
 void tb_ui_build_expanded_shell(const TbUiModel *model);
 void tb_ui_build_idle_shell(const TbUiModel *model);
 void tb_ui_build_layout(const TbUiModel *model);

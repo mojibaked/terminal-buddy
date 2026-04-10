@@ -24,6 +24,7 @@ typedef struct TbUiModel {
     float ui_scale;
     int mode;
     TbUiScene scene;
+    bool terminal_button_active;
     float pulse;
     float audio_level;
     uint64_t ticks_ms;
@@ -45,5 +46,7 @@ void tb_ui_set_text_debug_logging(bool enabled);
 bool tb_ui_get_text_debug_logging(void);
 bool tb_ui_render(const TbUiModel *model);
 bool tb_ui_primary_action_contains(float x, float y);
+bool tb_ui_bubble_contains(float x, float y);
+bool tb_ui_terminal_button_contains(float x, float y);
 
 #endif

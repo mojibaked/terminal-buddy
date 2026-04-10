@@ -214,3 +214,35 @@ bool tb_ui_primary_action_contains(float x, float y) {
         && x <= (data.boundingBox.x + data.boundingBox.width)
         && y <= (data.boundingBox.y + data.boundingBox.height);
 }
+
+static bool tb_ui_element_contains(const char *element_id, float x, float y) {
+    Clay_ElementData data;
+    Clay_String id_string;
+
+    if (!g_ui.ready || element_id == NULL) {
+        return false;
+    }
+
+    id_string = (Clay_String) {
+        .isStaticallyAllocated = false,
+        .length = (int32_t) SDL_strlen(element_id),
+        .chars = element_id
+    };
+    data = Clay_GetElementData(Clay_GetElementId(id_string));
+    if (!data.found) {
+        return false;
+    }
+
+    return x >= data.boundingBox.x
+        && y >= data.boundingBox.y
+        && x <= (data.boundingBox.x + data.boundingBox.width)
+        && y <= (data.boundingBox.y + data.boundingBox.height);
+}
+
+bool tb_ui_bubble_contains(float x, float y) {
+    return tb_ui_element_contains("BubbleFace", x, y);
+}
+
+bool tb_ui_terminal_button_contains(float x, float y) {
+    return tb_ui_element_contains("TerminalButton", x, y);
+}

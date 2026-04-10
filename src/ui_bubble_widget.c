@@ -80,3 +80,58 @@ void tb_ui_build_button(const TbUiModel *model, bool active) {
         }
     }
 }
+
+void tb_ui_build_terminal_button(const TbUiModel *model) {
+    bool active = model != NULL && model->terminal_button_active;
+    TbUiColors terminal_colors = tb_ui_colors_for_mode(2);
+    Clay_Color face = active ? tb_ui_color(38, 29, 20, 236) : tb_ui_color(18, 24, 35, 220);
+    Clay_Color border = active ? tb_ui_color(255, 182, 92, 170) : tb_ui_color(255, 255, 255, 24);
+    Clay_Color icon = active ? tb_ui_color(255, 205, 128, 255) : tb_ui_color(214, 226, 244, 214);
+    float button_size = tb_ui_terminal_button_size(model);
+    Clay_TextElementConfig icon_text = CLAY_TEXT_CONFIG({
+        .fontId = TB_UI_FONT_ID_BODY,
+        .fontSize = tb_ui_scale_u16(model, 16),
+        .textColor = icon
+    });
+    Clay_TextElementConfig caption_text = CLAY_TEXT_CONFIG({
+        .fontId = TB_UI_FONT_ID_BODY,
+        .fontSize = tb_ui_scale_u16(model, 9),
+        .textColor = active ? tb_ui_color(255, 214, 166, 220) : tb_ui_color(176, 186, 202, 164)
+    });
+
+    CLAY(CLAY_ID("TerminalButton"), {
+        .layout = {
+            .sizing = { CLAY_SIZING_FIXED(button_size), CLAY_SIZING_FIXED(button_size) },
+            .layoutDirection = CLAY_TOP_TO_BOTTOM,
+            .childGap = tb_ui_scale_u16(model, 3),
+            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+        },
+        .backgroundColor = face,
+        .cornerRadius = CLAY_CORNER_RADIUS(tb_ui_scale_value(model, 18)),
+        .border = {
+            .color = border,
+            .width = {1, 1, 1, 1}
+        }
+    }) {
+        CLAY(CLAY_ID("TerminalButtonPrompt"), {
+            .layout = {
+                .sizing = { CLAY_SIZING_FIXED(tb_ui_scale_value(model, 28)), CLAY_SIZING_FIXED(tb_ui_scale_value(model, 14)) },
+                .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+            },
+            .backgroundColor = active ? tb_ui_color(255, 171, 64, 42) : tb_ui_color(84, 96, 120, 34),
+            .cornerRadius = CLAY_CORNER_RADIUS(tb_ui_scale_value(model, 8))
+        }) {
+            CLAY_TEXT(tb_ui_string(">_"), icon_text);
+        }
+
+        CLAY(CLAY_ID("TerminalButtonCaptionBar"), {
+            .layout = {
+                .sizing = { CLAY_SIZING_FIXED(tb_ui_scale_value(model, 20)), CLAY_SIZING_FIXED(tb_ui_scale_value(model, 3)) }
+            },
+            .backgroundColor = active ? terminal_colors.accent : tb_ui_color(90, 102, 122, 120),
+            .cornerRadius = CLAY_CORNER_RADIUS(tb_ui_scale_value(model, 2))
+        }) {}
+
+        CLAY_TEXT(tb_ui_string("term"), caption_text);
+    }
+}

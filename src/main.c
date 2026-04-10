@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -16,17 +17,18 @@
 #include <SDL3/SDL_system.h>
 
 #include "transcription_backend.h"
+#include "owned_terminal_window.h"
+#include "sidecar_client.h"
 #include "ui_clay.h"
 
 #ifndef TERMINAL_BUDDY_SOURCE_DIR
 #define TERMINAL_BUDDY_SOURCE_DIR "."
 #endif
 
-#define IDLE_WINDOW_SIZE 96
-#define EXPANDED_WINDOW_WIDTH 360
+#define IDLE_WINDOW_WIDTH 164
+#define IDLE_WINDOW_HEIGHT 96
+#define EXPANDED_WINDOW_WIDTH 424
 #define EXPANDED_WINDOW_HEIGHT 132
-#define BUTTON_DIAMETER 76.0f
-#define BUTTON_MARGIN 10.0f
 #define DRAG_THRESHOLD 10.0f
 #define AUDIO_HISTORY_COUNT 20
 #define AUDIO_SAMPLE_RATE 24000
@@ -34,7 +36,9 @@
 #define AUDIO_LEVEL_DECAY 0.88f
 #define MAX_STATUS_TEXT 256
 #define MAX_TRANSCRIPT_TEXT 2048
-#define MAX_METRICS_TEXT 256
+#define MAX_METRICS_TEXT 768
+#define TB_OWNED_TERMINAL_PROJECT_ID "buddy-terminal"
+#define TB_OWNED_TERMINAL_SHELL_TARGET_ID "shell:buddy-terminal"
 
 #ifdef _WIN32
 #define TB_GLOBAL_HOTKEY_ID 0x5442
@@ -47,6 +51,12 @@ typedef enum PointerKind {
     POINTER_MOUSE,
     POINTER_FINGER
 } PointerKind;
+
+typedef enum TapTarget {
+    TAP_TARGET_NONE = 0,
+    TAP_TARGET_PANEL,
+    TAP_TARGET_TERMINAL
+} TapTarget;
 
 typedef enum AppMode {
     APP_MODE_STANDARD = 0,
@@ -73,6 +83,7 @@ typedef struct DragState {
     bool pressed;
     bool dragging;
     bool pending_toggle;
+    TapTarget tap_target;
     float start_global_x;
     float start_global_y;
     int window_start_x;
@@ -145,6 +156,11 @@ typedef struct TranscriptionState {
     char status_text[MAX_STATUS_TEXT];
     char transcript_text[MAX_TRANSCRIPT_TEXT];
     char metrics_text[MAX_METRICS_TEXT];
+    char sidecar_detail_text[TB_SIDECAR_TEXT_MAX];
+    bool pending_agent_launch;
+    char pending_agent_provider[TB_SIDECAR_CATEGORY_MAX];
+    char pending_agent_project_id[TB_SIDECAR_ID_MAX];
+    char pending_agent_shell_target_id[TB_SIDECAR_ID_MAX];
 } TranscriptionState;
 
 typedef struct WindowMetrics {
@@ -185,10 +201,17 @@ typedef struct AppState {
     TrayState tray;
     AudioState audio;
     TranscriptionState transcription;
+    TbSidecarClient sidecar;
+    TbOwnedTerminalWindow *owned_terminal_window;
 #ifdef _WIN32
     HWND app_hwnd;
     HWND last_external_hwnd;
     HWND injection_target_hwnd;
+    char owned_terminal_agent_target_id[TB_SIDECAR_ID_MAX];
+    char owned_terminal_agent_provider[TB_SIDECAR_CATEGORY_MAX];
+    HWND terminal_companion_hwnd;
+    HANDLE terminal_companion_process;
+    DWORD terminal_companion_pid;
 #endif
 } AppState;
 
@@ -217,6 +240,21 @@ static bool try_submit_terminal_target(AppState *state);
 static void clamp_window_to_display(AppState *state);
 static bool ui_is_processing(AppState *state);
 static void refresh_shell_state(AppState *state);
+static void refresh_sidecar_feedback(AppState *state);
+static void clear_pending_agent_launch_locked(TranscriptionState *transcription);
+static bool register_pending_agent_launch(AppState *state);
+static void populate_sidecar_context(
+    AppState *state,
+    char *project_id_out,
+    size_t project_id_size,
+    char *target_id_out,
+    size_t target_id_size
+);
+#ifdef _WIN32
+static bool launch_or_focus_terminal_companion(AppState *state);
+static bool focus_window_best_effort(HWND target);
+static bool upsert_owned_terminal_shell_target(AppState *state, const char *status);
+#endif
 
 static int fail(const char *message) {
     SDL_Log("%s: %s", message, SDL_GetError());
@@ -225,17 +263,6 @@ static int fail(const char *message) {
 
 static float squaref(float value) {
     return value * value;
-}
-
-static float button_center_x(const AppState *state) {
-    return (BUTTON_MARGIN + (BUTTON_DIAMETER * 0.5f)) * state->window_metrics.ui_scale;
-}
-
-static float button_center_y(const AppState *state, bool listening) {
-    if (listening) {
-        return ((float) EXPANDED_WINDOW_HEIGHT * 0.5f) * state->window_metrics.ui_scale;
-    }
-    return ((float) IDLE_WINDOW_SIZE * 0.5f) * state->window_metrics.ui_scale;
 }
 
 static const char *mode_key(AppMode mode) {
@@ -419,7 +446,7 @@ static int target_window_width(const AppState *state) {
     if (is_panel_expanded(state)) {
         return (int) SDL_roundf((float) EXPANDED_WINDOW_WIDTH * touch_scale);
     }
-    return (int) SDL_roundf((float) IDLE_WINDOW_SIZE * touch_scale);
+    return (int) SDL_roundf((float) IDLE_WINDOW_WIDTH * touch_scale);
 }
 
 static int target_window_height(const AppState *state) {
@@ -428,7 +455,7 @@ static int target_window_height(const AppState *state) {
     if (is_panel_expanded(state)) {
         return (int) SDL_roundf((float) EXPANDED_WINDOW_HEIGHT * touch_scale);
     }
-    return (int) SDL_roundf((float) IDLE_WINDOW_SIZE * touch_scale);
+    return (int) SDL_roundf((float) IDLE_WINDOW_HEIGHT * touch_scale);
 }
 
 static float default_touch_scale_for_display(float display_scale) {
@@ -760,6 +787,17 @@ static void shutdown_log_capture(void) {
     g_log_path = NULL;
 }
 
+static void clear_pending_agent_launch_locked(TranscriptionState *transcription) {
+    if (transcription == NULL) {
+        return;
+    }
+
+    transcription->pending_agent_launch = false;
+    transcription->pending_agent_provider[0] = '\0';
+    transcription->pending_agent_project_id[0] = '\0';
+    transcription->pending_agent_shell_target_id[0] = '\0';
+}
+
 static void transcription_set_ui(
     AppState *state,
     bool processing,
@@ -772,6 +810,7 @@ static void transcription_set_ui(
     state->transcription.processing = processing;
     state->transcription.show_feedback = show_feedback;
     state->transcription.terminal_submit_ready = false;
+    clear_pending_agent_launch_locked(&state->transcription);
     if (clipboard_dirty) {
         state->transcription.clipboard_dirty = true;
     }
@@ -782,6 +821,7 @@ static void transcription_set_ui(
     if (transcript != NULL) {
         SDL_snprintf(state->transcription.transcript_text, sizeof(state->transcription.transcript_text), "%s", transcript);
     }
+    state->transcription.sidecar_detail_text[0] = '\0';
     SDL_UnlockMutex(state->transcription.mutex);
 }
 
@@ -828,9 +868,11 @@ static void transcription_clear_feedback(AppState *state) {
     SDL_LockMutex(state->transcription.mutex);
     state->transcription.show_feedback = false;
     state->transcription.terminal_submit_ready = false;
+    clear_pending_agent_launch_locked(&state->transcription);
     state->transcription.status_text[0] = '\0';
     state->transcription.transcript_text[0] = '\0';
     state->transcription.metrics_text[0] = '\0';
+    state->transcription.sidecar_detail_text[0] = '\0';
     SDL_UnlockMutex(state->transcription.mutex);
 }
 
@@ -846,14 +888,64 @@ static void copy_transcription_snapshot(
     char *transcript_out,
     size_t transcript_size
 ) {
+    char combined_metrics[MAX_METRICS_TEXT];
+
     SDL_LockMutex(state->transcription.mutex);
     *processing = state->transcription.processing;
     *show_feedback = state->transcription.show_feedback;
     *terminal_submit_ready = state->transcription.terminal_submit_ready;
     SDL_snprintf(status_out, status_size, "%s", state->transcription.status_text);
-    SDL_snprintf(metrics_out, metrics_size, "%s", state->transcription.metrics_text);
     SDL_snprintf(transcript_out, transcript_size, "%s", state->transcription.transcript_text);
+    combined_metrics[0] = '\0';
+    if (state->transcription.metrics_text[0] != '\0' && state->transcription.sidecar_detail_text[0] != '\0') {
+        SDL_snprintf(
+            combined_metrics,
+            sizeof(combined_metrics),
+            "%s\n%s",
+            state->transcription.metrics_text,
+            state->transcription.sidecar_detail_text
+        );
+    } else if (state->transcription.metrics_text[0] != '\0') {
+        SDL_snprintf(combined_metrics, sizeof(combined_metrics), "%s", state->transcription.metrics_text);
+    } else if (state->transcription.sidecar_detail_text[0] != '\0') {
+        SDL_snprintf(combined_metrics, sizeof(combined_metrics), "%s", state->transcription.sidecar_detail_text);
+    }
+    SDL_snprintf(metrics_out, metrics_size, "%s", combined_metrics);
     SDL_UnlockMutex(state->transcription.mutex);
+}
+
+static void refresh_sidecar_feedback(AppState *state) {
+    bool changed = false;
+    char detail[TB_SIDECAR_TEXT_MAX];
+    bool show_feedback = false;
+    bool has_transcript = false;
+
+    if (state == NULL) {
+        return;
+    }
+
+    tb_sidecar_client_copy_snapshot(&state->sidecar, NULL, detail, sizeof(detail));
+
+    SDL_LockMutex(state->transcription.mutex);
+    show_feedback = state->transcription.show_feedback;
+    has_transcript = state->transcription.transcript_text[0] != '\0';
+    if ((!show_feedback || !has_transcript) && state->transcription.sidecar_detail_text[0] != '\0') {
+        state->transcription.sidecar_detail_text[0] = '\0';
+        changed = true;
+    } else if (show_feedback && has_transcript && SDL_strcmp(state->transcription.sidecar_detail_text, detail) != 0) {
+        SDL_snprintf(
+            state->transcription.sidecar_detail_text,
+            sizeof(state->transcription.sidecar_detail_text),
+            "%s",
+            detail
+        );
+        changed = true;
+    }
+    SDL_UnlockMutex(state->transcription.mutex);
+
+    if (changed) {
+        request_redraw(state);
+    }
 }
 
 static void reload_transcription_config(AppState *state) {
@@ -1764,12 +1856,6 @@ static bool set_control_mode(AppState *state, ControlMode mode, bool persist) {
     return true;
 }
 
-static bool point_in_circle(float x, float y, float center_x, float center_y, float radius) {
-    float dx = x - center_x;
-    float dy = y - center_y;
-    return (squaref(dx) + squaref(dy)) <= squaref(radius);
-}
-
 static bool point_in_active_surface(const AppState *state, float x, float y) {
     if (is_panel_expanded(state)) {
         return x >= 0.0f
@@ -1778,13 +1864,7 @@ static bool point_in_active_surface(const AppState *state, float x, float y) {
             && y <= (float) state->window_metrics.pixel_height;
     }
 
-    return point_in_circle(
-        x,
-        y,
-        button_center_x(state),
-        button_center_y(state, false),
-        (BUTTON_DIAMETER * 0.5f) * state->window_metrics.ui_scale
-    );
+    return tb_ui_bubble_contains(x, y) || tb_ui_terminal_button_contains(x, y);
 }
 
 static void begin_pointer_interaction(
@@ -1796,8 +1876,14 @@ static void begin_pointer_interaction(
     float global_x,
     float global_y
 ) {
+    TapTarget tap_target = TAP_TARGET_PANEL;
+
     if (!point_in_active_surface(state, local_x, local_y)) {
         return;
+    }
+
+    if (tb_ui_terminal_button_contains(local_x, local_y)) {
+        tap_target = TAP_TARGET_TERMINAL;
     }
 
     clamp_window_to_display(state);
@@ -1807,6 +1893,7 @@ static void begin_pointer_interaction(
     state->drag.pressed = true;
     state->drag.dragging = false;
     state->drag.pending_toggle = true;
+    state->drag.tap_target = tap_target;
     state->drag.start_global_x = global_x;
     state->drag.start_global_y = global_y;
     state->drag.window_start_x = state->window_x;
@@ -1870,6 +1957,9 @@ static bool handle_feedback_primary_action_tap(AppState *state, float local_x, f
     }
 
     if (try_submit_terminal_target(state)) {
+        if (!register_pending_agent_launch(state)) {
+            SDL_Log("Submitted the terminal command, but Buddy could not attach the launched agent target.");
+        }
         collapse_panel(state);
     } else {
         SDL_LockMutex(state->transcription.mutex);
@@ -1884,15 +1974,34 @@ static bool handle_feedback_primary_action_tap(AppState *state, float local_x, f
 static void end_pointer_interaction(AppState *state, float local_x, float local_y) {
     bool should_toggle = state->drag.pressed && state->drag.pending_toggle && !state->drag.dragging;
     bool moved = state->drag.dragging;
+    TapTarget tap_target = state->drag.tap_target;
 
     state->drag.kind = POINTER_NONE;
     state->drag.finger_id = 0;
     state->drag.pressed = false;
     state->drag.dragging = false;
     state->drag.pending_toggle = false;
+    state->drag.tap_target = TAP_TARGET_NONE;
 
-    if (should_toggle && !handle_feedback_primary_action_tap(state, local_x, local_y)) {
-        handle_panel_tap(state);
+    if (should_toggle) {
+        if (tap_target == TAP_TARGET_TERMINAL && tb_ui_terminal_button_contains(local_x, local_y)) {
+#ifdef _WIN32
+            launch_or_focus_terminal_companion(state);
+#else
+            transcription_set_ui(
+                state,
+                false,
+                true,
+                false,
+                "TERMINAL UNSUPPORTED",
+                "The embedded terminal launcher is only implemented on Windows right now."
+            );
+            resize_for_mode(state);
+            apply_window_visibility_policy(state);
+#endif
+        } else if (!handle_feedback_primary_action_tap(state, local_x, local_y)) {
+            handle_panel_tap(state);
+        }
     }
 
     if (moved) {
@@ -1949,6 +2058,7 @@ static void render(AppState *state) {
         model.scene = TB_UI_SCENE_IDLE;
     }
     model.mode = (int) state->mode;
+    model.terminal_button_active = state->mode == APP_MODE_TERMINAL;
     model.pulse = pulse;
     model.audio_level = state->audio.level;
     model.ticks_ms = ticks_ms;
@@ -2397,13 +2507,335 @@ static void update_last_external_window(AppState *state) {
     }
 }
 
-static bool window_process_is_windows_terminal(HWND window) {
+static bool utf8_from_wide(const wchar_t *input, char *out_text, size_t out_text_size) {
+    int needed = 0;
+
+    if (out_text == NULL || out_text_size == 0) {
+        return false;
+    }
+
+    out_text[0] = '\0';
+    if (input == NULL || input[0] == L'\0') {
+        return false;
+    }
+
+    needed = WideCharToMultiByte(CP_UTF8, 0, input, -1, NULL, 0, NULL, NULL);
+    if (needed <= 0 || (size_t) needed > out_text_size) {
+        return false;
+    }
+
+    return WideCharToMultiByte(CP_UTF8, 0, input, -1, out_text, needed, NULL, NULL) > 0;
+}
+
+static bool wide_from_utf8(const char *input, wchar_t *out_text, size_t out_text_size) {
+    int needed = 0;
+
+    if (out_text == NULL || out_text_size == 0) {
+        return false;
+    }
+
+    out_text[0] = L'\0';
+    if (input == NULL || input[0] == '\0') {
+        return false;
+    }
+
+    needed = MultiByteToWideChar(CP_UTF8, 0, input, -1, NULL, 0);
+    if (needed <= 0 || (size_t) needed > out_text_size) {
+        return false;
+    }
+
+    return MultiByteToWideChar(CP_UTF8, 0, input, -1, out_text, needed) > 0;
+}
+
+static HWND owned_terminal_hwnd(const AppState *state) {
+    if (state == NULL || state->owned_terminal_window == NULL) {
+        return NULL;
+    }
+
+    return (HWND) tb_owned_terminal_window_native_handle(state->owned_terminal_window);
+}
+
+static bool owned_terminal_matches_hwnd(const AppState *state, HWND target) {
+    HWND owned = owned_terminal_hwnd(state);
+
+    return target != NULL && owned != NULL && target == owned;
+}
+
+static bool owned_terminal_target_id_matches(const AppState *state, const char *target_id) {
+    if (target_id == NULL || target_id[0] == '\0') {
+        return false;
+    }
+
+    if (SDL_strcmp(target_id, TB_OWNED_TERMINAL_SHELL_TARGET_ID) == 0) {
+        return true;
+    }
+
+    return state != NULL
+        && state->owned_terminal_agent_target_id[0] != '\0'
+        && SDL_strcmp(target_id, state->owned_terminal_agent_target_id) == 0;
+}
+
+static void clear_terminal_companion_tracking(AppState *state) {
+    if (state == NULL) {
+        return;
+    }
+
+    if (state->terminal_companion_process != NULL) {
+        CloseHandle(state->terminal_companion_process);
+        state->terminal_companion_process = NULL;
+    }
+    state->terminal_companion_pid = 0;
+    state->terminal_companion_hwnd = NULL;
+}
+
+static void refresh_terminal_companion_tracking(AppState *state) {
+    if (state == NULL || state->terminal_companion_process == NULL) {
+        return;
+    }
+
+    if (WaitForSingleObject(state->terminal_companion_process, 0) == WAIT_TIMEOUT) {
+        return;
+    }
+
+    clear_terminal_companion_tracking(state);
+}
+
+typedef struct TbWindowSearchContext {
+    DWORD process_id;
+    HWND window;
+} TbWindowSearchContext;
+
+static BOOL CALLBACK find_visible_window_for_process_cb(HWND window, LPARAM lparam) {
+    TbWindowSearchContext *context = (TbWindowSearchContext *) lparam;
+    DWORD process_id = 0;
+
+    if (context == NULL || !IsWindow(window) || !IsWindowVisible(window)) {
+        return TRUE;
+    }
+    if (GetWindow(window, GW_OWNER) != NULL) {
+        return TRUE;
+    }
+
+    GetWindowThreadProcessId(window, &process_id);
+    if (process_id != context->process_id) {
+        return TRUE;
+    }
+
+    context->window = window;
+    return FALSE;
+}
+
+static HWND find_visible_window_for_process(DWORD process_id) {
+    TbWindowSearchContext context;
+
+    SDL_zero(context);
+    if (process_id == 0) {
+        return NULL;
+    }
+
+    context.process_id = process_id;
+    EnumWindows(find_visible_window_for_process_cb, (LPARAM) &context);
+    return context.window;
+}
+
+static bool resolve_terminal_companion_path(char *out_path, size_t out_path_size) {
+    const char *base_path = NULL;
+
+    if (out_path == NULL || out_path_size == 0) {
+        return false;
+    }
+
+    out_path[0] = '\0';
+    base_path = SDL_GetBasePath();
+    if (base_path == NULL) {
+        return false;
+    }
+
+    SDL_snprintf(out_path, out_path_size, "%sterminal-buddy-terminal.exe", base_path);
+    SDL_free((void *) base_path);
+    return out_path[0] != '\0';
+}
+
+static bool terminal_companion_exists(const char *utf8_path) {
+    wchar_t wide_path[MAX_PATH];
+    DWORD attributes = 0;
+
+    if (!wide_from_utf8(utf8_path, wide_path, SDL_arraysize(wide_path))) {
+        return false;
+    }
+
+    attributes = GetFileAttributesW(wide_path);
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+static bool focus_terminal_companion(AppState *state) {
+    HWND window = NULL;
+
+    if (state == NULL) {
+        return false;
+    }
+
+    refresh_terminal_companion_tracking(state);
+    window = state->terminal_companion_hwnd;
+    if (window == NULL || !IsWindow(window)) {
+        window = find_visible_window_for_process(state->terminal_companion_pid);
+    }
+    if (window == NULL || !IsWindow(window)) {
+        return false;
+    }
+
+    state->terminal_companion_hwnd = window;
+    state->last_external_hwnd = window;
+    state->injection_target_hwnd = window;
+    focus_window_best_effort(window);
+    return true;
+}
+
+static bool launch_or_focus_terminal_companion(AppState *state) {
+    char exe_path[TB_SIDECAR_PATH_MAX];
+    wchar_t wide_exe_path[MAX_PATH];
+    STARTUPINFOW startup_info;
+    PROCESS_INFORMATION process_info;
+    HWND launched_window = NULL;
+    Uint64 deadline = 0;
+
+    if (state == NULL) {
+        return false;
+    }
+
+    set_mode(state, APP_MODE_TERMINAL, true);
+
+    if (state->owned_terminal_window != NULL && tb_owned_terminal_window_is_available()) {
+        if (tb_owned_terminal_window_show(state->owned_terminal_window)) {
+            HWND owned_window = owned_terminal_hwnd(state);
+
+            if (owned_window != NULL) {
+                state->last_external_hwnd = owned_window;
+                state->injection_target_hwnd = owned_window;
+                focus_window_best_effort(owned_window);
+                upsert_owned_terminal_shell_target(state, "idle");
+            }
+            request_redraw(state);
+            return true;
+        }
+    }
+
+    if (focus_terminal_companion(state)) {
+        return true;
+    }
+
+    if (!resolve_terminal_companion_path(exe_path, sizeof(exe_path))) {
+        transcription_set_ui(
+            state,
+            false,
+            true,
+            false,
+            "TERMINAL PATH FAILED",
+            "Buddy could not resolve the terminal companion executable path."
+        );
+        resize_for_mode(state);
+        apply_window_visibility_policy(state);
+        return false;
+    }
+
+    if (!terminal_companion_exists(exe_path)) {
+        char detail[MAX_TRANSCRIPT_TEXT];
+
+        SDL_snprintf(
+            detail,
+            sizeof(detail),
+            "Build the companion first:\ncmake --build build --target terminal-buddy-terminal\n\nExpected path:\n%s",
+            exe_path
+        );
+        transcription_set_ui(
+            state,
+            false,
+            true,
+            false,
+            "TERMINAL NOT BUILT",
+            detail
+        );
+        resize_for_mode(state);
+        apply_window_visibility_policy(state);
+        return false;
+    }
+
+    if (!wide_from_utf8(exe_path, wide_exe_path, SDL_arraysize(wide_exe_path))) {
+        transcription_set_ui(
+            state,
+            false,
+            true,
+            false,
+            "TERMINAL PATH FAILED",
+            exe_path
+        );
+        resize_for_mode(state);
+        apply_window_visibility_policy(state);
+        return false;
+    }
+
+    SDL_zero(startup_info);
+    SDL_zero(process_info);
+    startup_info.cb = sizeof(startup_info);
+
+    if (!CreateProcessW(wide_exe_path, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &startup_info, &process_info)) {
+        char detail[MAX_TRANSCRIPT_TEXT];
+
+        SDL_snprintf(
+            detail,
+            sizeof(detail),
+            "CreateProcessW failed with error %lu while launching:\n%s",
+            (unsigned long) GetLastError(),
+            exe_path
+        );
+        transcription_set_ui(
+            state,
+            false,
+            true,
+            false,
+            "TERMINAL LAUNCH FAILED",
+            detail
+        );
+        resize_for_mode(state);
+        apply_window_visibility_policy(state);
+        return false;
+    }
+
+    CloseHandle(process_info.hThread);
+    clear_terminal_companion_tracking(state);
+    state->terminal_companion_process = process_info.hProcess;
+    state->terminal_companion_pid = process_info.dwProcessId;
+    state->terminal_companion_hwnd = NULL;
+
+    deadline = SDL_GetTicks() + 5000u;
+    while (SDL_GetTicks() < deadline) {
+        launched_window = find_visible_window_for_process(state->terminal_companion_pid);
+        if (launched_window != NULL) {
+            break;
+        }
+        SDL_Delay(50);
+    }
+
+    if (launched_window != NULL) {
+        state->terminal_companion_hwnd = launched_window;
+        state->last_external_hwnd = launched_window;
+        state->injection_target_hwnd = launched_window;
+        focus_window_best_effort(launched_window);
+    }
+
+    request_redraw(state);
+    return true;
+}
+
+static bool query_window_process_path_wide(HWND window, wchar_t *path, DWORD path_capacity, DWORD *process_id_out) {
     DWORD process_id = 0;
     HANDLE process = NULL;
-    wchar_t path[MAX_PATH];
-    DWORD path_size = MAX_PATH;
-    const wchar_t *basename = NULL;
 
+    if (path == NULL || path_capacity == 0) {
+        return false;
+    }
+
+    path[0] = L'\0';
     GetWindowThreadProcessId(window, &process_id);
     if (process_id == 0) {
         return false;
@@ -2414,16 +2846,379 @@ static bool window_process_is_windows_terminal(HWND window) {
         return false;
     }
 
-    if (!QueryFullProcessImageNameW(process, 0, path, &path_size)) {
+    if (!QueryFullProcessImageNameW(process, 0, path, &path_capacity)) {
         CloseHandle(process);
         return false;
     }
 
     CloseHandle(process);
+    if (process_id_out != NULL) {
+        *process_id_out = process_id;
+    }
+    return true;
+}
+
+static bool query_window_process_metadata_utf8(
+    HWND window,
+    char *process_name_out,
+    size_t process_name_out_size,
+    char *process_dir_out,
+    size_t process_dir_out_size,
+    DWORD *process_id_out
+) {
+    wchar_t path[MAX_PATH];
+    wchar_t directory[MAX_PATH];
+    DWORD path_size = MAX_PATH;
+    const wchar_t *basename = NULL;
+    size_t directory_length = 0;
+
+    if (process_name_out != NULL && process_name_out_size > 0) {
+        process_name_out[0] = '\0';
+    }
+    if (process_dir_out != NULL && process_dir_out_size > 0) {
+        process_dir_out[0] = '\0';
+    }
+
+    if (!query_window_process_path_wide(window, path, path_size, process_id_out)) {
+        return false;
+    }
 
     basename = wcsrchr(path, L'\\');
     basename = (basename != NULL) ? basename + 1 : path;
-    return _wcsicmp(basename, L"WindowsTerminal.exe") == 0;
+    if (process_name_out != NULL && process_name_out_size > 0) {
+        utf8_from_wide(basename, process_name_out, process_name_out_size);
+    }
+
+    wcsncpy(directory, path, SDL_arraysize(directory) - 1);
+    directory[SDL_arraysize(directory) - 1] = L'\0';
+    directory_length = wcslen(directory);
+    while (directory_length > 0 && directory[directory_length - 1] != L'\\' && directory[directory_length - 1] != L'/') {
+        --directory_length;
+    }
+    if (directory_length > 0) {
+        directory[directory_length - 1] = L'\0';
+    } else {
+        directory[0] = L'\0';
+    }
+
+    if (process_dir_out != NULL && process_dir_out_size > 0) {
+        utf8_from_wide(directory, process_dir_out, process_dir_out_size);
+    }
+    return true;
+}
+
+static bool query_window_title_utf8(HWND window, char *title_out, size_t title_out_size) {
+    wchar_t title[TB_SIDECAR_TEXT_MAX];
+
+    if (title_out == NULL || title_out_size == 0) {
+        return false;
+    }
+
+    title_out[0] = '\0';
+    if (!IsWindow(window)) {
+        return false;
+    }
+
+    if (GetWindowTextW(window, title, (int) SDL_arraysize(title)) <= 0) {
+        return false;
+    }
+
+    return utf8_from_wide(title, title_out, title_out_size);
+}
+
+static bool upsert_owned_terminal_shell_target(AppState *state, const char *status) {
+    HWND window = owned_terminal_hwnd(state);
+    char process_name[TB_SIDECAR_TEXT_MAX];
+    char process_dir[TB_SIDECAR_PATH_MAX];
+    char label[TB_SIDECAR_TEXT_MAX];
+    char window_id[TB_SIDECAR_ID_MAX];
+    DWORD process_id = 0;
+    const char *occupancy = "utility";
+    const char *attached_agent_target_id = NULL;
+
+    if (state == NULL || window == NULL || !IsWindow(window)) {
+        return false;
+    }
+
+    process_name[0] = '\0';
+    process_dir[0] = '\0';
+    label[0] = '\0';
+    window_id[0] = '\0';
+    query_window_process_metadata_utf8(
+        window,
+        process_name,
+        sizeof(process_name),
+        process_dir,
+        sizeof(process_dir),
+        &process_id
+    );
+    SDL_snprintf(label, sizeof(label), "%s", tb_owned_terminal_window_title(state->owned_terminal_window));
+    SDL_snprintf(window_id, sizeof(window_id), "win32:%p", (void *) window);
+
+    if (state->owned_terminal_agent_target_id[0] != '\0') {
+        occupancy = "agent_host";
+        attached_agent_target_id = state->owned_terminal_agent_target_id;
+    }
+
+    return tb_sidecar_client_upsert_window_target(
+        &state->sidecar,
+        "observed_shell",
+        "shell",
+        TB_OWNED_TERMINAL_SHELL_TARGET_ID,
+        TB_OWNED_TERMINAL_PROJECT_ID,
+        process_dir,
+        label,
+        status != NULL && status[0] != '\0' ? status : "idle",
+        "low",
+        window_id,
+        (Uint32) process_id,
+        process_name,
+        occupancy,
+        attached_agent_target_id,
+        NULL
+    );
+}
+
+static void slugify_identifier(const char *text, char *out_text, size_t out_text_size) {
+    bool previous_was_dash = false;
+    size_t written = 0;
+    const unsigned char *cursor = (const unsigned char *) text;
+
+    if (out_text == NULL || out_text_size == 0) {
+        return;
+    }
+
+    out_text[0] = '\0';
+    if (text == NULL) {
+        return;
+    }
+
+    while (*cursor != '\0' && written + 1 < out_text_size) {
+        unsigned char ch = *cursor++;
+
+        if (ch >= 'A' && ch <= 'Z') {
+            out_text[written++] = (char) (ch - 'A' + 'a');
+            previous_was_dash = false;
+            continue;
+        }
+        if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
+            out_text[written++] = (char) ch;
+            previous_was_dash = false;
+            continue;
+        }
+        if (!previous_was_dash && written > 0) {
+            out_text[written++] = '-';
+            previous_was_dash = true;
+        }
+    }
+
+    while (written > 0 && out_text[written - 1] == '-') {
+        --written;
+    }
+    out_text[written] = '\0';
+}
+
+static bool contains_substring_ci(const char *text, const char *pattern) {
+    size_t pattern_length = 0;
+    size_t offset = 0;
+
+    if (text == NULL || pattern == NULL || pattern[0] == '\0') {
+        return false;
+    }
+
+    pattern_length = SDL_strlen(pattern);
+    while (text[offset] != '\0') {
+        size_t index = 0;
+        while (
+            index < pattern_length
+            && text[offset + index] != '\0'
+            && tolower((unsigned char) text[offset + index]) == tolower((unsigned char) pattern[index])
+        ) {
+            ++index;
+        }
+        if (index == pattern_length) {
+            return true;
+        }
+        ++offset;
+    }
+
+    return false;
+}
+
+static bool copy_trimmed_range(const char *start, size_t length, char *out_text, size_t out_text_size) {
+    size_t begin = 0;
+    size_t end = length;
+    size_t write_length = 0;
+
+    if (out_text == NULL || out_text_size == 0) {
+        return false;
+    }
+
+    out_text[0] = '\0';
+    if (start == NULL || length == 0) {
+        return false;
+    }
+
+    while (begin < length && isspace((unsigned char) start[begin])) {
+        ++begin;
+    }
+    while (end > begin && isspace((unsigned char) start[end - 1])) {
+        --end;
+    }
+    if (end <= begin) {
+        return false;
+    }
+
+    write_length = end - begin;
+    if (write_length >= out_text_size) {
+        write_length = out_text_size - 1;
+    }
+    SDL_memcpy(out_text, start + begin, write_length);
+    out_text[write_length] = '\0';
+    return write_length > 0;
+}
+
+static bool is_generic_project_label(const char *text) {
+    char slug[TB_SIDECAR_ID_MAX];
+    static const char *generic_slugs[] = {
+        "claude",
+        "codex",
+        "powershell",
+        "pwsh",
+        "terminal",
+        "windows-terminal",
+        "command-prompt",
+        "cmd",
+        "shell",
+        "administrator",
+        "admin"
+    };
+    size_t index = 0;
+
+    slugify_identifier(text, slug, sizeof(slug));
+    if (slug[0] == '\0') {
+        return true;
+    }
+
+    for (index = 0; index < SDL_arraysize(generic_slugs); ++index) {
+        if (SDL_strcmp(slug, generic_slugs[index]) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void infer_project_label(const char *title, const char *process_name, char *out_text, size_t out_text_size) {
+    static const char *separators[] = {" - ", " | ", " : "};
+    size_t index = 0;
+
+    if (out_text == NULL || out_text_size == 0) {
+        return;
+    }
+
+    out_text[0] = '\0';
+    if (title != NULL && title[0] != '\0') {
+        for (index = 0; index < SDL_arraysize(separators); ++index) {
+            const char *separator = separators[index];
+            const char *found = SDL_strstr(title, separator);
+            char left[TB_SIDECAR_TEXT_MAX];
+            char right[TB_SIDECAR_TEXT_MAX];
+
+            if (found == NULL) {
+                continue;
+            }
+
+            left[0] = '\0';
+            right[0] = '\0';
+            copy_trimmed_range(title, (size_t) (found - title), left, sizeof(left));
+            copy_trimmed_range(
+                found + SDL_strlen(separator),
+                SDL_strlen(found + SDL_strlen(separator)),
+                right,
+                sizeof(right)
+            );
+
+            if (left[0] != '\0' && !is_generic_project_label(left)) {
+                SDL_snprintf(out_text, out_text_size, "%s", left);
+                return;
+            }
+            if (right[0] != '\0' && !is_generic_project_label(right)) {
+                SDL_snprintf(out_text, out_text_size, "%s", right);
+                return;
+            }
+        }
+
+        if (!is_generic_project_label(title)) {
+            SDL_snprintf(out_text, out_text_size, "%s", title);
+            return;
+        }
+    }
+
+    if (process_name != NULL && process_name[0] != '\0' && !is_generic_project_label(process_name)) {
+        SDL_snprintf(out_text, out_text_size, "%s", process_name);
+    }
+}
+
+static void classify_observed_target(
+    const char *title,
+    const char *process_name,
+    const char **target_kind_out,
+    const char **provider_out
+) {
+    const char *target_kind = "observed_shell";
+    const char *provider = "shell";
+
+    if (contains_substring_ci(title, "claude") || contains_substring_ci(process_name, "claude")) {
+        target_kind = "observed_agent";
+        provider = "claude";
+    } else if (contains_substring_ci(title, "codex") || contains_substring_ci(process_name, "codex")) {
+        target_kind = "observed_agent";
+        provider = "codex";
+    }
+
+    if (target_kind_out != NULL) {
+        *target_kind_out = target_kind;
+    }
+    if (provider_out != NULL) {
+        *provider_out = provider;
+    }
+}
+
+static HWND target_id_to_hwnd(const char *target_id) {
+    const char *marker = NULL;
+    unsigned long long raw = 0;
+
+    if (target_id == NULL || target_id[0] == '\0') {
+        return NULL;
+    }
+
+    marker = SDL_strstr(target_id, ":win32:");
+    if (marker == NULL) {
+        return NULL;
+    }
+
+    marker += SDL_strlen(":win32:");
+    if (SDL_sscanf(marker, "%llx", &raw) != 1) {
+        return NULL;
+    }
+
+    return (HWND) (uintptr_t) raw;
+}
+
+static bool target_id_looks_shell(const char *target_id) {
+    return target_id != NULL && SDL_strncmp(target_id, "shell:", 6) == 0;
+}
+
+static bool window_process_is_windows_terminal(HWND window) {
+    char process_name[TB_SIDECAR_TEXT_MAX];
+
+    process_name[0] = '\0';
+    if (!query_window_process_metadata_utf8(window, process_name, sizeof(process_name), NULL, 0, NULL)) {
+        return false;
+    }
+
+    return SDL_strcasecmp(process_name, "WindowsTerminal.exe") == 0;
 }
 
 static HWND resolve_injection_target_hwnd(const AppState *state) {
@@ -2443,6 +3238,277 @@ static HWND resolve_injection_target_hwnd(const AppState *state) {
     }
 
     return target;
+}
+
+static void populate_sidecar_context(
+    AppState *state,
+    char *project_id_out,
+    size_t project_id_size,
+    char *target_id_out,
+    size_t target_id_size
+) {
+    HWND target = NULL;
+    DWORD process_id = 0;
+    const char *target_kind = "observed_shell";
+    const char *provider = "shell";
+    char title[TB_SIDECAR_TEXT_MAX];
+    char process_name[TB_SIDECAR_TEXT_MAX];
+    char process_dir[TB_SIDECAR_PATH_MAX];
+    char project_label[TB_SIDECAR_TEXT_MAX];
+    char label[TB_SIDECAR_TEXT_MAX];
+    char window_id[TB_SIDECAR_ID_MAX];
+
+    if (project_id_out != NULL && project_id_size > 0) {
+        project_id_out[0] = '\0';
+    }
+    if (target_id_out != NULL && target_id_size > 0) {
+        target_id_out[0] = '\0';
+    }
+    if (state == NULL) {
+        return;
+    }
+
+    target = resolve_injection_target_hwnd(state);
+    if (target == NULL || !IsWindow(target)) {
+        return;
+    }
+
+    if (owned_terminal_matches_hwnd(state, target)) {
+        if (project_id_out != NULL && project_id_size > 0) {
+            SDL_snprintf(project_id_out, project_id_size, "%s", TB_OWNED_TERMINAL_PROJECT_ID);
+        }
+        if (target_id_out != NULL && target_id_size > 0) {
+            SDL_snprintf(target_id_out, target_id_size, "%s", TB_OWNED_TERMINAL_SHELL_TARGET_ID);
+        }
+        upsert_owned_terminal_shell_target(state, "idle");
+        return;
+    }
+
+    title[0] = '\0';
+    process_name[0] = '\0';
+    process_dir[0] = '\0';
+    project_label[0] = '\0';
+    label[0] = '\0';
+    window_id[0] = '\0';
+    query_window_title_utf8(target, title, sizeof(title));
+    query_window_process_metadata_utf8(
+        target,
+        process_name,
+        sizeof(process_name),
+        process_dir,
+        sizeof(process_dir),
+        &process_id
+    );
+    classify_observed_target(title, process_name, &target_kind, &provider);
+
+    if (title[0] != '\0') {
+        SDL_snprintf(label, sizeof(label), "%s", title);
+    } else if (SDL_strcmp(provider, "claude") == 0) {
+        SDL_snprintf(label, sizeof(label), "Claude session");
+    } else if (SDL_strcmp(provider, "codex") == 0) {
+        SDL_snprintf(label, sizeof(label), "Codex session");
+    } else if (process_name[0] != '\0') {
+        SDL_snprintf(label, sizeof(label), "%s", process_name);
+    } else {
+        SDL_snprintf(label, sizeof(label), "External shell");
+    }
+
+    infer_project_label(title, process_name, project_label, sizeof(project_label));
+    if (project_id_out != NULL && project_id_size > 0) {
+        slugify_identifier(project_label[0] != '\0' ? project_label : (title[0] != '\0' ? title : process_name), project_id_out, project_id_size);
+        if (project_id_out[0] == '\0') {
+            SDL_snprintf(project_id_out, project_id_size, "desktop-shell");
+        }
+    }
+
+    if (target_id_out != NULL && target_id_size > 0) {
+        SDL_snprintf(target_id_out, target_id_size, "%s:win32:%p", provider, (void *) target);
+    }
+    SDL_snprintf(window_id, sizeof(window_id), "win32:%p", (void *) target);
+
+    if (
+        project_id_out != NULL
+        && project_id_out[0] != '\0'
+        && target_id_out != NULL
+        && target_id_out[0] != '\0'
+    ) {
+        if (!tb_sidecar_client_upsert_observed_target(
+                &state->sidecar,
+                target_kind,
+                provider,
+                target_id_out,
+                project_id_out,
+                process_dir,
+                label,
+                window_id,
+                (Uint32) process_id,
+                process_name
+            )) {
+            target_id_out[0] = '\0';
+        }
+    }
+}
+
+static bool register_pending_agent_launch(AppState *state) {
+    HWND target = NULL;
+    DWORD process_id = 0;
+    char provider[TB_SIDECAR_CATEGORY_MAX];
+    char project_id[TB_SIDECAR_ID_MAX];
+    char shell_target_id[TB_SIDECAR_ID_MAX];
+    char title[TB_SIDECAR_TEXT_MAX];
+    char process_name[TB_SIDECAR_TEXT_MAX];
+    char process_dir[TB_SIDECAR_PATH_MAX];
+    char shell_label[TB_SIDECAR_TEXT_MAX];
+    char project_label[TB_SIDECAR_TEXT_MAX];
+    char window_id[TB_SIDECAR_ID_MAX];
+    bool pending_launch = false;
+
+    if (state == NULL || state->transcription.mutex == NULL) {
+        return false;
+    }
+
+    provider[0] = '\0';
+    project_id[0] = '\0';
+    shell_target_id[0] = '\0';
+    SDL_LockMutex(state->transcription.mutex);
+    pending_launch = state->transcription.pending_agent_launch;
+    if (pending_launch) {
+        SDL_snprintf(provider, sizeof(provider), "%s", state->transcription.pending_agent_provider);
+        SDL_snprintf(project_id, sizeof(project_id), "%s", state->transcription.pending_agent_project_id);
+        SDL_snprintf(shell_target_id, sizeof(shell_target_id), "%s", state->transcription.pending_agent_shell_target_id);
+    }
+    SDL_UnlockMutex(state->transcription.mutex);
+
+    if (!pending_launch) {
+        return true;
+    }
+
+    if (SDL_strcmp(provider, "claude") != 0 && SDL_strcmp(provider, "codex") != 0) {
+        return false;
+    }
+
+    if (SDL_strcmp(shell_target_id, TB_OWNED_TERMINAL_SHELL_TARGET_ID) == 0) {
+        HWND window = owned_terminal_hwnd(state);
+        char owned_process_name[TB_SIDECAR_TEXT_MAX];
+        char owned_process_dir[TB_SIDECAR_PATH_MAX];
+        char label[TB_SIDECAR_TEXT_MAX];
+        char owned_window_id[TB_SIDECAR_ID_MAX];
+        DWORD local_process_id = 0;
+
+        if (window == NULL || !IsWindow(window)) {
+            return false;
+        }
+
+        owned_process_name[0] = '\0';
+        owned_process_dir[0] = '\0';
+        label[0] = '\0';
+        owned_window_id[0] = '\0';
+        query_window_process_metadata_utf8(
+            window,
+            owned_process_name,
+            sizeof(owned_process_name),
+            owned_process_dir,
+            sizeof(owned_process_dir),
+            &local_process_id
+        );
+        SDL_snprintf(label, sizeof(label), "%s", tb_owned_terminal_window_title(state->owned_terminal_window));
+        SDL_snprintf(owned_window_id, sizeof(owned_window_id), "win32:%p", (void *) window);
+        SDL_snprintf(
+            state->owned_terminal_agent_provider,
+            sizeof(state->owned_terminal_agent_provider),
+            "%s",
+            provider
+        );
+        SDL_snprintf(
+            state->owned_terminal_agent_target_id,
+            sizeof(state->owned_terminal_agent_target_id),
+            "%s:buddy-terminal",
+            provider
+        );
+
+        if (!tb_sidecar_client_upsert_window_target(
+                &state->sidecar,
+                "observed_agent",
+                provider,
+                state->owned_terminal_agent_target_id,
+                project_id[0] != '\0' ? project_id : TB_OWNED_TERMINAL_PROJECT_ID,
+                owned_process_dir,
+                SDL_strcmp(provider, "claude") == 0 ? "Claude session" : "Codex session",
+                "launching_agent",
+                "low",
+                owned_window_id,
+                (Uint32) local_process_id,
+                owned_process_name,
+                NULL,
+                NULL,
+                TB_OWNED_TERMINAL_SHELL_TARGET_ID
+            )) {
+            return false;
+        }
+
+        return upsert_owned_terminal_shell_target(state, "launching_agent");
+    }
+
+    target = target_id_to_hwnd(shell_target_id);
+    if (target == NULL || !IsWindow(target)) {
+        target = resolve_injection_target_hwnd(state);
+    }
+    if (target == NULL || !IsWindow(target)) {
+        return false;
+    }
+
+    title[0] = '\0';
+    process_name[0] = '\0';
+    process_dir[0] = '\0';
+    shell_label[0] = '\0';
+    project_label[0] = '\0';
+    window_id[0] = '\0';
+    query_window_title_utf8(target, title, sizeof(title));
+    query_window_process_metadata_utf8(
+        target,
+        process_name,
+        sizeof(process_name),
+        process_dir,
+        sizeof(process_dir),
+        &process_id
+    );
+
+    if (title[0] != '\0') {
+        SDL_snprintf(shell_label, sizeof(shell_label), "%s", title);
+    } else if (process_name[0] != '\0') {
+        SDL_snprintf(shell_label, sizeof(shell_label), "%s", process_name);
+    } else {
+        SDL_snprintf(shell_label, sizeof(shell_label), "External shell");
+    }
+
+    if (project_id[0] == '\0') {
+        infer_project_label(title, process_name, project_label, sizeof(project_label));
+        slugify_identifier(
+            project_label[0] != '\0' ? project_label : (title[0] != '\0' ? title : process_name),
+            project_id,
+            sizeof(project_id)
+        );
+        if (project_id[0] == '\0') {
+            SDL_snprintf(project_id, sizeof(project_id), "desktop-shell");
+        }
+    }
+
+    SDL_snprintf(window_id, sizeof(window_id), "win32:%p", (void *) target);
+    if (!target_id_looks_shell(shell_target_id)) {
+        SDL_snprintf(shell_target_id, sizeof(shell_target_id), "shell:%s", window_id);
+    }
+
+    return tb_sidecar_client_register_observed_agent_launch(
+        &state->sidecar,
+        provider,
+        shell_target_id,
+        project_id,
+        process_dir,
+        shell_label,
+        window_id,
+        (Uint32) process_id,
+        process_name
+    );
 }
 
 static bool focus_window_best_effort(HWND target) {
@@ -2543,6 +3609,10 @@ static bool send_virtual_key(WORD virtual_key) {
 static bool injection_target_is_windows_terminal(const AppState *state) {
     HWND target = resolve_injection_target_hwnd(state);
 
+    if (owned_terminal_matches_hwnd(state, target)) {
+        return true;
+    }
+
     return target != NULL && window_process_is_windows_terminal(target);
 }
 
@@ -2554,6 +3624,11 @@ static bool try_inject_transcript(AppState *state, const char *transcript) {
     }
     if (transcript == NULL || transcript[0] == '\0') {
         return false;
+    }
+
+    if (owned_terminal_matches_hwnd(state, target)) {
+        return state->owned_terminal_window != NULL
+            && tb_owned_terminal_window_submit_text(state->owned_terminal_window, transcript, false);
     }
 
     if (!SDL_SetClipboardText(transcript)) {
@@ -2570,6 +3645,11 @@ static bool try_inject_transcript(AppState *state, const char *transcript) {
 
 static bool try_submit_terminal_target(AppState *state) {
     HWND target = resolve_injection_target_hwnd(state);
+
+    if (owned_terminal_matches_hwnd(state, target)) {
+        return state->owned_terminal_window != NULL
+            && tb_owned_terminal_window_send_enter(state->owned_terminal_window);
+    }
 
     if (target == NULL || !window_process_is_windows_terminal(target)) {
         return false;
@@ -2607,6 +3687,32 @@ static bool try_submit_terminal_target(AppState *state) {
     (void) state;
     return false;
 }
+
+static bool target_id_looks_shell(const char *target_id) {
+    (void) target_id;
+    return false;
+}
+
+static bool register_pending_agent_launch(AppState *state) {
+    (void) state;
+    return true;
+}
+
+static void populate_sidecar_context(
+    AppState *state,
+    char *project_id_out,
+    size_t project_id_size,
+    char *target_id_out,
+    size_t target_id_size
+) {
+    (void) state;
+    if (project_id_out != NULL && project_id_size > 0) {
+        project_id_out[0] = '\0';
+    }
+    if (target_id_out != NULL && target_id_size > 0) {
+        target_id_out[0] = '\0';
+    }
+}
 #endif
 
 static int transcription_worker(void *userdata) {
@@ -2640,7 +3746,9 @@ static int transcription_worker(void *userdata) {
     state->transcription.processing = false;
     state->transcription.show_feedback = true;
     state->transcription.terminal_submit_ready = false;
+    clear_pending_agent_launch_locked(&state->transcription);
     state->transcription.worker_done = true;
+    state->transcription.sidecar_detail_text[0] = '\0';
     if (response_text != NULL) {
         SDL_snprintf(state->transcription.status_text, sizeof(state->transcription.status_text), "%s", "TRANSCRIPT READY");
         SDL_snprintf(state->transcription.transcript_text, sizeof(state->transcription.transcript_text), "%s", response_text);
@@ -2750,6 +3858,7 @@ static bool begin_transcription(AppState *state) {
     SDL_snprintf(state->transcription.status_text, sizeof(state->transcription.status_text), "%s", "TRANSCRIBING");
     state->transcription.transcript_text[0] = '\0';
     state->transcription.metrics_text[0] = '\0';
+    state->transcription.sidecar_detail_text[0] = '\0';
     SDL_UnlockMutex(state->transcription.mutex);
 
     state->transcription.worker = SDL_CreateThread(transcription_worker, "transcription-worker", job);
@@ -2815,7 +3924,24 @@ static void pump_transcription_results(AppState *state) {
     bool should_copy = false;
     bool terminal_submit_ready = false;
     char transcript[MAX_TRANSCRIPT_TEXT];
+    char active_project_id[TB_SIDECAR_ID_MAX];
+    char active_target_id[TB_SIDECAR_ID_MAX];
+    TbSidecarRouteDecision route_decision;
+    TbSidecarProjectSummary project_summary;
+    TbSidecarTargetSnapshot target_snapshot;
+    const char *text_to_inject = transcript;
+    const char *status_text = NULL;
+    const char *pending_launch_project_id = NULL;
+    const char *pending_launch_shell_target_id = NULL;
+    bool routed = false;
     bool injected = false;
+    bool summary_ready = false;
+    bool snapshot_ready = false;
+    bool should_arm_pending_launch = false;
+
+    SDL_zero(route_decision);
+    SDL_zero(project_summary);
+    SDL_zero(target_snapshot);
 
     SDL_LockMutex(state->transcription.mutex);
     should_reap = state->transcription.worker_done && state->transcription.worker != NULL;
@@ -2827,15 +3953,173 @@ static void pump_transcription_results(AppState *state) {
     SDL_UnlockMutex(state->transcription.mutex);
 
     if (should_copy && transcript[0] != '\0') {
-        terminal_submit_ready = state->mode == APP_MODE_TERMINAL && injection_target_is_windows_terminal(state);
-        injected = try_inject_transcript(state, transcript);
+        populate_sidecar_context(
+            state,
+            active_project_id,
+            sizeof(active_project_id),
+            active_target_id,
+            sizeof(active_target_id)
+        );
+
+        if (state->mode == APP_MODE_TERMINAL) {
+            routed = tb_sidecar_client_route_utterance(
+                &state->sidecar,
+                transcript,
+                active_project_id[0] != '\0' ? active_project_id : NULL,
+                active_target_id[0] != '\0' ? active_target_id : NULL,
+                250,
+                &route_decision
+            );
+            if (routed) {
+                if (route_decision.has_command_text) {
+                    text_to_inject = route_decision.command_text;
+                } else {
+                    text_to_inject = NULL;
+                }
+#ifdef _WIN32
+                if (route_decision.selected_target_id[0] != '\0') {
+                    HWND routed_target = target_id_to_hwnd(route_decision.selected_target_id);
+                    if (owned_terminal_target_id_matches(state, route_decision.selected_target_id)) {
+                        HWND owned_target = owned_terminal_hwnd(state);
+
+                        if (owned_target != NULL && IsWindow(owned_target)) {
+                            state->injection_target_hwnd = owned_target;
+                        } else {
+                            text_to_inject = NULL;
+                        }
+                    } else if (routed_target != NULL && IsWindow(routed_target)) {
+                        state->injection_target_hwnd = routed_target;
+                    } else if (
+                        active_target_id[0] != '\0'
+                        && SDL_strcmp(route_decision.selected_target_id, active_target_id) != 0
+                    ) {
+                        text_to_inject = NULL;
+                    }
+                }
+#endif
+            }
+
+            if (routed && SDL_strcmp(route_decision.category, "fleet_meta") == 0) {
+                const char *summary_project_id = route_decision.selected_project_id[0] != '\0'
+                    ? route_decision.selected_project_id
+                    : (active_project_id[0] != '\0' ? active_project_id : NULL);
+                summary_ready = tb_sidecar_client_request_project_summary(
+                    &state->sidecar,
+                    summary_project_id,
+                    false,
+                    300,
+                    &project_summary
+                );
+            } else if (
+                routed
+                && route_decision.selected_target_id[0] != '\0'
+                && SDL_strcmp(route_decision.category, "host_control") == 0
+            ) {
+                snapshot_ready = tb_sidecar_client_request_target_snapshot(
+                    &state->sidecar,
+                    route_decision.selected_target_id,
+                    200,
+                    &target_snapshot
+                );
+            } else if (
+                routed
+                && route_decision.selected_target_id[0] != '\0'
+                && SDL_strcmp(route_decision.category, "target_directed") == 0
+            ) {
+                snapshot_ready = tb_sidecar_client_request_target_snapshot(
+                    &state->sidecar,
+                    route_decision.selected_target_id,
+                    200,
+                    &target_snapshot
+                );
+            }
+        } else {
+            tb_sidecar_client_submit_utterance(
+                &state->sidecar,
+                transcript,
+                active_project_id[0] != '\0' ? active_project_id : NULL,
+                active_target_id[0] != '\0' ? active_target_id : NULL
+            );
+        }
+
+        if (text_to_inject != NULL && text_to_inject[0] != '\0') {
+            terminal_submit_ready = state->mode == APP_MODE_TERMINAL && injection_target_is_windows_terminal(state);
+            injected = try_inject_transcript(state, text_to_inject);
+        }
+
+        if (routed) {
+            if (SDL_strcmp(route_decision.category, "host_control") == 0) {
+                if (SDL_strcmp(route_decision.host_action_kind, "launch_agent") == 0) {
+                    if (route_decision.has_command_text) {
+                        status_text = (terminal_submit_ready && injected) ? "AGENT LAUNCH READY" : (injected ? "PASTED AGENT LAUNCH" : "AGENT LAUNCH PLANNED");
+                    } else {
+                        status_text = snapshot_ready ? "AGENT LAUNCH READY" : "AGENT LAUNCH NEEDED";
+                    }
+                } else if (route_decision.has_command_text) {
+                    status_text = (terminal_submit_ready && injected) ? "COMMAND READY" : (injected ? "PASTED COMMAND" : "COMMAND PLANNED");
+                } else {
+                    status_text = snapshot_ready ? "HOST ACTION READY" : "HOST ACTION NEEDED";
+                }
+            } else if (SDL_strcmp(route_decision.category, "target_directed") == 0) {
+                if (route_decision.has_command_text) {
+                    status_text = (terminal_submit_ready && injected) ? "AGENT MESSAGE READY" : (injected ? "PASTED TO AGENT" : "AGENT TARGETED");
+                } else {
+                    status_text = snapshot_ready ? "AGENT CONTEXT READY" : "AGENT TARGET NEEDED";
+                }
+            } else if (SDL_strcmp(route_decision.category, "fleet_meta") == 0) {
+                status_text = summary_ready ? "SUMMARY READY" : "SUMMARY REQUEST READY";
+            } else if (SDL_strcmp(route_decision.category, "ambiguous") == 0) {
+                status_text = "NEEDS CLARIFICATION";
+            }
+        }
+
+        if (status_text == NULL) {
+            status_text = (terminal_submit_ready && injected) ? "PASTED TO TERMINAL" : (injected ? "PASTED TO TARGET" : "TRANSCRIPT READY");
+        }
+
+        should_arm_pending_launch =
+            routed
+            && terminal_submit_ready
+            && injected
+            && SDL_strcmp(route_decision.category, "host_control") == 0
+            && SDL_strcmp(route_decision.host_action_kind, "launch_agent") == 0
+            && route_decision.agent_provider[0] != '\0';
+        pending_launch_project_id = route_decision.selected_project_id[0] != '\0'
+            ? route_decision.selected_project_id
+            : (active_project_id[0] != '\0' ? active_project_id : NULL);
+        pending_launch_shell_target_id = route_decision.selected_target_id[0] != '\0'
+            ? route_decision.selected_target_id
+            : (target_id_looks_shell(active_target_id) ? active_target_id : NULL);
+
         SDL_LockMutex(state->transcription.mutex);
         state->transcription.terminal_submit_ready = terminal_submit_ready && injected;
+        clear_pending_agent_launch_locked(&state->transcription);
+        if (should_arm_pending_launch) {
+            state->transcription.pending_agent_launch = true;
+            SDL_snprintf(
+                state->transcription.pending_agent_provider,
+                sizeof(state->transcription.pending_agent_provider),
+                "%s",
+                route_decision.agent_provider
+            );
+            SDL_snprintf(
+                state->transcription.pending_agent_project_id,
+                sizeof(state->transcription.pending_agent_project_id),
+                "%s",
+                pending_launch_project_id != NULL ? pending_launch_project_id : ""
+            );
+            SDL_snprintf(
+                state->transcription.pending_agent_shell_target_id,
+                sizeof(state->transcription.pending_agent_shell_target_id),
+                "%s",
+                pending_launch_shell_target_id != NULL ? pending_launch_shell_target_id : ""
+            );
+        }
         SDL_snprintf(
             state->transcription.status_text,
             sizeof(state->transcription.status_text),
             "%s",
-            (terminal_submit_ready && injected) ? "PASTED TO TERMINAL" : (injected ? "PASTED TO TARGET" : "TRANSCRIPT READY")
+            status_text
         );
         SDL_UnlockMutex(state->transcription.mutex);
         request_redraw(state);
@@ -2877,14 +4161,18 @@ static void destroy_transcription_state(AppState *state) {
     state->transcription.env_path = NULL;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     AppState state;
 
+    (void) argc;
+    (void) argv;
     SDL_zero(state);
     state.running = true;
     state.visible = true;
     state.needs_redraw = true;
     state.perf_logging_enabled = perf_logging_from_env();
+    tb_sidecar_client_init(&state.sidecar);
+    state.owned_terminal_window = tb_owned_terminal_window_create();
     state.transcription.mutex = SDL_CreateMutex();
 
     if (state.transcription.mutex == NULL) {
@@ -2907,11 +4195,14 @@ int main(void) {
 
     load_preferences(&state);
     reload_transcription_config(&state);
+    if (!tb_sidecar_client_start(&state.sidecar, TERMINAL_BUDDY_SOURCE_DIR)) {
+        SDL_Log("Continuing without sidecar routing");
+    }
 
     state.window = SDL_CreateWindow(
         "terminal-buddy",
-        IDLE_WINDOW_SIZE,
-        IDLE_WINDOW_SIZE,
+        IDLE_WINDOW_WIDTH,
+        IDLE_WINDOW_HEIGHT,
         SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_TRANSPARENT | SDL_WINDOW_NOT_FOCUSABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY
     );
     if (state.window == NULL) {
@@ -2976,6 +4267,23 @@ int main(void) {
                 handle_hotkey_action(&state);
                 continue;
             }
+            if (
+                state.owned_terminal_window != NULL
+                && tb_owned_terminal_window_handles_event(state.owned_terminal_window, &event)
+            ) {
+#ifdef _WIN32
+                HWND owned_window = owned_terminal_hwnd(&state);
+
+                if (owned_window != NULL) {
+                    state.last_external_hwnd = owned_window;
+                    if (state.mode == APP_MODE_TERMINAL) {
+                        state.injection_target_hwnd = owned_window;
+                    }
+                    upsert_owned_terminal_shell_target(&state, "idle");
+                }
+#endif
+                continue;
+            }
 
             switch (event.type) {
                 case SDL_EVENT_QUIT:
@@ -3036,6 +4344,10 @@ int main(void) {
         update_last_external_window(&state);
         update_audio_meter(&state);
         pump_transcription_results(&state);
+        refresh_sidecar_feedback(&state);
+        if (state.owned_terminal_window != NULL) {
+            tb_owned_terminal_window_tick(state.owned_terminal_window);
+        }
 
         processing = ui_is_processing(&state);
         animated = (state.listening || processing) && !state.drag.dragging;
@@ -3073,6 +4385,10 @@ int main(void) {
             }
         }
 
+        if (state.owned_terminal_window != NULL && tb_owned_terminal_window_has_window(state.owned_terminal_window)) {
+            sleep_ms = SDL_min(sleep_ms, 16u);
+        }
+
         SDL_Delay(sleep_ms);
     }
 
@@ -3091,7 +4407,12 @@ int main(void) {
     save_preferences(&state);
     destroy_tray(&state);
     destroy_audio(&state);
+    tb_sidecar_client_shutdown(&state.sidecar);
+#ifdef _WIN32
+    clear_terminal_companion_tracking(&state);
+#endif
     destroy_transcription_state(&state);
+    tb_owned_terminal_window_destroy(state.owned_terminal_window);
     tb_ui_shutdown();
     shutdown_perf_logging();
 
