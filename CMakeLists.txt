@@ -12,13 +12,21 @@ set(TB_ONNXRUNTIME_QNN_VERSION "1.24.4")
 set(TB_ONNXRUNTIME_QNN_INCLUDE_DIR
     "${CMAKE_SOURCE_DIR}/build/nuget-cache/Microsoft.ML.OnnxRuntime.QNN.${TB_ONNXRUNTIME_QNN_VERSION}/build/native/include"
 )
-set(TERMINAL_BUDDY_NPU_STT_SOURCE_DIR
-    "${CMAKE_SOURCE_DIR}/../npu-stt-c"
+set(TERMINAL_BUDDY_NPU_VOICE_SOURCE_DIR
+    "${CMAKE_SOURCE_DIR}/../npu-voice-c"
     CACHE PATH
-    "Path to the npu-stt-c source checkout."
+    "Path to the npu-voice-c source checkout."
+)
+set(TERMINAL_BUDDY_NPU_STT_ARTIFACT_ROOT
+    "${CMAKE_SOURCE_DIR}/../npu-voice-assets/stt"
+    CACHE PATH
+    "Install-root style STT asset folder used by the local NPU backend defaults."
 )
 
 option(TERMINAL_BUDDY_STATIC "Statically link SDL libraries into the executable." OFF)
+option(TERMINAL_BUDDY_BUILD_APP "Build the SDL UI app." ON)
+option(TERMINAL_BUDDY_BUILD_TEXT_ENGINE_PROBE "Build the text engine probe." ON)
+option(TERMINAL_BUDDY_BUILD_TRANSCRIPTION_PROBE "Build the transcription probe." ON)
 
 if(TERMINAL_BUDDY_STATIC)
     set(BUILD_SHARED_LIBS OFF)
@@ -40,7 +48,9 @@ option(TERMINAL_BUDDY_USE_SYSTEM_SDL "Prefer an installed SDL3 package before fe
 
 if(TERMINAL_BUDDY_USE_SYSTEM_SDL)
     find_package(SDL3 CONFIG QUIET)
-    find_package(SDL3_ttf CONFIG QUIET)
+    if(TERMINAL_BUDDY_BUILD_APP OR TERMINAL_BUDDY_BUILD_TEXT_ENGINE_PROBE)
+        find_package(SDL3_ttf CONFIG QUIET)
+    endif()
 endif()
 
 if(NOT SDL3_FOUND)
@@ -54,7 +64,7 @@ if(NOT SDL3_FOUND)
     FetchContent_MakeAvailable(SDL3)
 endif()
 
-if(NOT SDL3_ttf_FOUND)
+if((TERMINAL_BUDDY_BUILD_APP OR TERMINAL_BUDDY_BUILD_TEXT_ENGINE_PROBE) AND NOT SDL3_ttf_FOUND)
     FetchContent_Declare(
         SDL3_ttf
         GIT_REPOSITORY https://github.com/libsdl-org/SDL_ttf.git
@@ -88,67 +98,76 @@ if(NOT TARGET kissfft::kissfft)
 endif()
 
 set(TERMINAL_BUDDY_HAVE_NPU_STT OFF)
-if(EXISTS "${TERMINAL_BUDDY_NPU_STT_SOURCE_DIR}/CMakeLists.txt")
-    set(NPU_STT_BUILD_EXAMPLES OFF CACHE BOOL "Disable npu-stt-c examples in terminal-buddy builds." FORCE)
-    set(NPU_STT_BUILD_BENCHMARKS OFF CACHE BOOL "Disable npu-stt-c benchmarks in terminal-buddy builds." FORCE)
-    set(NPU_STT_BUILD_TESTS OFF CACHE BOOL "Disable npu-stt-c tests in terminal-buddy builds." FORCE)
-    set(NPU_STT_BUILD_NO_HEADERS_SMOKE OFF CACHE BOOL "Disable npu-stt-c no-header smoke in terminal-buddy builds." FORCE)
-    set(NPU_STT_INSTALL OFF CACHE BOOL "Disable npu-stt-c install rules in terminal-buddy builds." FORCE)
+if(EXISTS "${TERMINAL_BUDDY_NPU_VOICE_SOURCE_DIR}/CMakeLists.txt")
+    set(NPU_VOICE_BUILD_COMMON ON CACHE BOOL "Build the shared npu-voice common layer." FORCE)
+    set(NPU_VOICE_BUILD_STT ON CACHE BOOL "Build the npu-voice STT library." FORCE)
+    set(NPU_VOICE_BUILD_TTS OFF CACHE BOOL "Disable the npu-voice TTS library in terminal-buddy builds." FORCE)
+    set(NPU_STT_BUILD_EXAMPLES OFF CACHE BOOL "Disable umbrella STT examples in terminal-buddy builds." FORCE)
+    set(NPU_STT_BUILD_BENCHMARKS OFF CACHE BOOL "Disable umbrella STT benchmarks in terminal-buddy builds." FORCE)
+    set(NPU_STT_BUILD_TESTS OFF CACHE BOOL "Disable umbrella STT tests in terminal-buddy builds." FORCE)
+    set(NPU_STT_BUILD_NO_HEADERS_SMOKE OFF CACHE BOOL "Disable umbrella STT no-header smoke in terminal-buddy builds." FORCE)
+    set(NPU_STT_INSTALL OFF CACHE BOOL "Disable umbrella STT install rules in terminal-buddy builds." FORCE)
 
     if(EXISTS "${TB_ONNXRUNTIME_QNN_INCLUDE_DIR}/onnxruntime_c_api.h")
         set(
             NPU_STT_ONNXRUNTIME_QNN_INCLUDE_DIR
             "${TB_ONNXRUNTIME_QNN_INCLUDE_DIR}"
             CACHE PATH
-            "Path to the ONNX Runtime QNN C headers for npu-stt-c."
+            "Path to the ONNX Runtime QNN C headers for the umbrella STT library."
             FORCE
         )
     endif()
 
-    add_subdirectory("${TERMINAL_BUDDY_NPU_STT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/npu-stt-c")
+    add_subdirectory("${TERMINAL_BUDDY_NPU_VOICE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/npu-voice-c")
     set(TERMINAL_BUDDY_HAVE_NPU_STT ON)
 else()
-    message(WARNING "npu-stt-c not found at ${TERMINAL_BUDDY_NPU_STT_SOURCE_DIR}; the NPU backend will build in stub mode.")
+    message(WARNING "npu-voice-c not found at ${TERMINAL_BUDDY_NPU_VOICE_SOURCE_DIR}; the NPU backend will build in stub mode.")
 endif()
 
-add_executable(terminal-buddy WIN32
-    src/main.c
-    src/ui_clay.c
-    src/ui_clay.h
-    src/ui_clay_internal.h
-    src/ui_bubble_widget.c
-    src/ui_panel_widget.c
-    src/ui_root.c
-    src/transcription_backend.c
-    src/transcription_backend.h
-    src/transcription_backend_openai_win32.c
-    src/transcription_backend_npu_win32.c
-)
+if(TERMINAL_BUDDY_BUILD_APP)
+    add_executable(terminal-buddy WIN32
+        src/main.c
+        src/ui_clay.c
+        src/ui_clay.h
+        src/ui_clay_internal.h
+        src/ui_bubble_widget.c
+        src/ui_panel_widget.c
+        src/ui_root.c
+        src/transcription_backend.c
+        src/transcription_backend.h
+        src/transcription_backend_openai_win32.c
+        src/transcription_backend_npu_win32.c
+    )
 
-add_executable(text-engine-probe
-    src/text_engine_probe.c
-)
+    target_include_directories(terminal-buddy PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/third_party/clay
+    )
+endif()
 
-add_executable(transcription-probe
-    src/transcription_probe.c
-    src/transcription_backend.c
-    src/transcription_backend.h
-    src/transcription_backend_openai_win32.c
-    src/transcription_backend_npu_win32.c
-)
+if(TERMINAL_BUDDY_BUILD_TEXT_ENGINE_PROBE)
+    add_executable(text-engine-probe
+        src/text_engine_probe.c
+    )
 
-target_include_directories(terminal-buddy PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/third_party/clay
-)
+    target_include_directories(text-engine-probe PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+    )
+endif()
 
-target_include_directories(text-engine-probe PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-)
+if(TERMINAL_BUDDY_BUILD_TRANSCRIPTION_PROBE)
+    add_executable(transcription-probe
+        src/transcription_probe.c
+        src/transcription_backend.c
+        src/transcription_backend.h
+        src/transcription_backend_openai_win32.c
+        src/transcription_backend_npu_win32.c
+    )
 
-target_include_directories(transcription-probe PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-)
+    target_include_directories(transcription-probe PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+    )
+endif()
 
 if(TERMINAL_BUDDY_STATIC)
     set(_SDL3_TARGET SDL3::SDL3-static)
@@ -158,64 +177,90 @@ else()
     set(_SDL3_TTF_TARGET SDL3_ttf::SDL3_ttf)
 endif()
 
-target_link_libraries(terminal-buddy PRIVATE
-    ${_SDL3_TARGET}
-    ${_SDL3_TTF_TARGET}
-)
-target_link_libraries(text-engine-probe PRIVATE
-    ${_SDL3_TARGET}
-    ${_SDL3_TTF_TARGET}
-)
-target_link_libraries(transcription-probe PRIVATE
-    ${_SDL3_TARGET}
-)
-
-if(TERMINAL_BUDDY_HAVE_NPU_STT)
-    target_link_libraries(terminal-buddy PRIVATE npu_stt::npu_stt)
-    target_link_libraries(transcription-probe PRIVATE npu_stt::npu_stt)
-    target_compile_definitions(
-        terminal-buddy
-        PRIVATE
-            TB_HAVE_NPU_STT=1
-            TERMINAL_BUDDY_NPU_STT_SOURCE_DIR="${TERMINAL_BUDDY_NPU_STT_SOURCE_DIR}"
-    )
-    target_compile_definitions(
-        transcription-probe
-        PRIVATE
-            TB_HAVE_NPU_STT=1
-            TERMINAL_BUDDY_NPU_STT_SOURCE_DIR="${TERMINAL_BUDDY_NPU_STT_SOURCE_DIR}"
+if(TERMINAL_BUDDY_BUILD_APP)
+    target_link_libraries(terminal-buddy PRIVATE
+        ${_SDL3_TARGET}
+        ${_SDL3_TTF_TARGET}
     )
 endif()
-target_compile_definitions(terminal-buddy PRIVATE TERMINAL_BUDDY_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_compile_definitions(text-engine-probe PRIVATE TERMINAL_BUDDY_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_compile_definitions(transcription-probe PRIVATE TERMINAL_BUDDY_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+if(TERMINAL_BUDDY_BUILD_TEXT_ENGINE_PROBE)
+    target_link_libraries(text-engine-probe PRIVATE
+        ${_SDL3_TARGET}
+        ${_SDL3_TTF_TARGET}
+    )
+endif()
+if(TERMINAL_BUDDY_BUILD_TRANSCRIPTION_PROBE)
+    target_link_libraries(transcription-probe PRIVATE
+        ${_SDL3_TARGET}
+    )
+endif()
+
+if(TERMINAL_BUDDY_HAVE_NPU_STT)
+    if(TERMINAL_BUDDY_BUILD_APP)
+        target_link_libraries(terminal-buddy PRIVATE npu_stt::npu_stt)
+        target_compile_definitions(
+            terminal-buddy
+            PRIVATE
+                TB_HAVE_NPU_STT=1
+                TERMINAL_BUDDY_NPU_STT_INSTALL_ROOT="${TERMINAL_BUDDY_NPU_STT_ARTIFACT_ROOT}"
+        )
+    endif()
+    if(TERMINAL_BUDDY_BUILD_TRANSCRIPTION_PROBE)
+        target_link_libraries(transcription-probe PRIVATE npu_stt::npu_stt)
+        target_compile_definitions(
+            transcription-probe
+            PRIVATE
+                TB_HAVE_NPU_STT=1
+                TERMINAL_BUDDY_NPU_STT_INSTALL_ROOT="${TERMINAL_BUDDY_NPU_STT_ARTIFACT_ROOT}"
+        )
+    endif()
+endif()
+if(TERMINAL_BUDDY_BUILD_APP)
+    target_compile_definitions(terminal-buddy PRIVATE TERMINAL_BUDDY_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+endif()
+if(TERMINAL_BUDDY_BUILD_TEXT_ENGINE_PROBE)
+    target_compile_definitions(text-engine-probe PRIVATE TERMINAL_BUDDY_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+endif()
+if(TERMINAL_BUDDY_BUILD_TRANSCRIPTION_PROBE)
+    target_compile_definitions(transcription-probe PRIVATE TERMINAL_BUDDY_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+endif()
 
 if(WIN32)
-    target_link_libraries(terminal-buddy PRIVATE winhttp)
-    target_link_libraries(transcription-probe PRIVATE winhttp)
-    target_link_libraries(text-engine-probe PRIVATE)
-    add_custom_command(
-        TARGET terminal-buddy
-        POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy -t $<TARGET_FILE_DIR:terminal-buddy> $<TARGET_RUNTIME_DLLS:terminal-buddy>
-        COMMAND_EXPAND_LISTS
-    )
-    add_custom_command(
-        TARGET text-engine-probe
-        POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy -t $<TARGET_FILE_DIR:text-engine-probe> $<TARGET_RUNTIME_DLLS:text-engine-probe>
-        COMMAND_EXPAND_LISTS
-    )
-    add_custom_command(
-        TARGET transcription-probe
-        POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy -t $<TARGET_FILE_DIR:transcription-probe> $<TARGET_RUNTIME_DLLS:transcription-probe>
-        COMMAND_EXPAND_LISTS
-    )
+    if(TERMINAL_BUDDY_BUILD_APP)
+        target_link_libraries(terminal-buddy PRIVATE winhttp)
+        add_custom_command(
+            TARGET terminal-buddy
+            POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy -t $<TARGET_FILE_DIR:terminal-buddy> $<TARGET_RUNTIME_DLLS:terminal-buddy>
+            COMMAND_EXPAND_LISTS
+        )
+    endif()
+    if(TERMINAL_BUDDY_BUILD_TEXT_ENGINE_PROBE)
+        target_link_libraries(text-engine-probe PRIVATE)
+        add_custom_command(
+            TARGET text-engine-probe
+            POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy -t $<TARGET_FILE_DIR:text-engine-probe> $<TARGET_RUNTIME_DLLS:text-engine-probe>
+            COMMAND_EXPAND_LISTS
+        )
+    endif()
+    if(TERMINAL_BUDDY_BUILD_TRANSCRIPTION_PROBE)
+        target_link_libraries(transcription-probe PRIVATE winhttp)
+        add_custom_command(
+            TARGET transcription-probe
+            POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy -t $<TARGET_FILE_DIR:transcription-probe> $<TARGET_RUNTIME_DLLS:transcription-probe>
+            COMMAND_EXPAND_LISTS
+        )
+    endif()
 endif()
 
 if(MSVC)
-    target_compile_options(terminal-buddy PRIVATE /W4 /permissive-)
+    if(TERMINAL_BUDDY_BUILD_APP)
+        target_compile_options(terminal-buddy PRIVATE /W4 /permissive-)
+    endif()
 else()
-    target_compile_options(terminal-buddy PRIVATE -Wall -Wextra -Wpedantic)
+    if(TERMINAL_BUDDY_BUILD_APP)
+        target_compile_options(terminal-buddy PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
 endif()

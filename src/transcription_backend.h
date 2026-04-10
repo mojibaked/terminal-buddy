@@ -25,6 +25,7 @@ typedef struct TbTranscriptionConfig {
     char model[TB_TRANSCRIPTION_MODEL_MAX];
     char npu_model[TB_TRANSCRIPTION_MODEL_MAX];
     char api_key[TB_TRANSCRIPTION_API_KEY_MAX];
+    char install_root[TB_TRANSCRIPTION_PATH_MAX];
     char runtime_dir[TB_TRANSCRIPTION_PATH_MAX];
     char package_dir[TB_TRANSCRIPTION_PATH_MAX];
     char tokenizer_vocab_path[TB_TRANSCRIPTION_PATH_MAX];
@@ -80,6 +81,7 @@ bool tb_transcription_backend_openai_execute(
 
 void tb_transcription_backend_npu_configure(
     TbTranscriptionConfig *config,
+    const char *install_root_override,
     const char *runtime_dir_override,
     const char *package_dir_override,
     const char *tokenizer_vocab_override,

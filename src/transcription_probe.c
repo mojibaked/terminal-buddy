@@ -148,6 +148,7 @@ int main(int argc, char **argv) {
     printf("model=%s\n", config.model);
     printf("status=%s\n", config.missing_status);
     printf("detail=%s\n", config.missing_detail);
+    printf("install_root=%s\n", config.install_root);
     printf("runtime_dir=%s\n", config.runtime_dir);
     printf("package_dir=%s\n", config.package_dir);
     printf("tokenizer_vocab=%s\n", config.tokenizer_vocab_path);

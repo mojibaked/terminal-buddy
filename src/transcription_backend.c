@@ -78,7 +78,7 @@ static void apply_backend_defaults(TbTranscriptionConfig *config) {
                 config->missing_detail,
                 sizeof(config->missing_detail),
                 "%s",
-                "Set TB_TRANSCRIPTION_BACKEND=npu and stage the sibling npu-stt-c runtime/model assets to enable local offline Whisper transcription."
+                "Set TB_TRANSCRIPTION_BACKEND=npu and stage the sibling STT runtime/model assets to enable local offline Whisper transcription."
             );
             break;
         case TB_TRANSCRIPTION_BACKEND_OPENAI:
@@ -130,6 +130,7 @@ void tb_transcription_reload_env(TbTranscriptionConfig *config, const char *env_
         char backend_value[TB_TRANSCRIPTION_BACKEND_NAME_MAX];
         char openai_model_value[TB_TRANSCRIPTION_MODEL_MAX];
         char npu_model_value[TB_TRANSCRIPTION_MODEL_MAX];
+        char install_root_value[TB_TRANSCRIPTION_PATH_MAX];
         char runtime_dir_value[TB_TRANSCRIPTION_PATH_MAX];
         char package_dir_value[TB_TRANSCRIPTION_PATH_MAX];
         char tokenizer_vocab_value[TB_TRANSCRIPTION_PATH_MAX];
@@ -141,6 +142,7 @@ void tb_transcription_reload_env(TbTranscriptionConfig *config, const char *env_
         backend_value[0] = '\0';
         openai_model_value[0] = '\0';
         npu_model_value[0] = '\0';
+        install_root_value[0] = '\0';
         runtime_dir_value[0] = '\0';
         package_dir_value[0] = '\0';
         tokenizer_vocab_value[0] = '\0';
@@ -163,6 +165,8 @@ void tb_transcription_reload_env(TbTranscriptionConfig *config, const char *env_
                         SDL_snprintf(openai_model_value, sizeof(openai_model_value), "%s", value);
                     } else if (SDL_strcmp(key, "TB_TRANSCRIPTION_MODEL") == 0) {
                         SDL_snprintf(npu_model_value, sizeof(npu_model_value), "%s", value);
+                    } else if (SDL_strcmp(key, "TB_NPU_INSTALL_ROOT") == 0) {
+                        SDL_snprintf(install_root_value, sizeof(install_root_value), "%s", value);
                     } else if (SDL_strcmp(key, "TB_NPU_RUNTIME_DIR") == 0) {
                         SDL_snprintf(runtime_dir_value, sizeof(runtime_dir_value), "%s", value);
                     } else if (SDL_strcmp(key, "TB_NPU_MODEL_DIR") == 0 || SDL_strcmp(key, "TB_NPU_PACKAGE_DIR") == 0) {
@@ -184,6 +188,7 @@ void tb_transcription_reload_env(TbTranscriptionConfig *config, const char *env_
         trim_newlines(backend_value);
         trim_newlines(openai_model_value);
         trim_newlines(npu_model_value);
+        trim_newlines(install_root_value);
         trim_newlines(runtime_dir_value);
         trim_newlines(package_dir_value);
         trim_newlines(tokenizer_vocab_value);
@@ -214,6 +219,7 @@ void tb_transcription_reload_env(TbTranscriptionConfig *config, const char *env_
         if (config->backend == TB_TRANSCRIPTION_BACKEND_NPU) {
             tb_transcription_backend_npu_configure(
                 config,
+                install_root_value,
                 runtime_dir_value,
                 package_dir_value,
                 tokenizer_vocab_value,

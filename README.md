@@ -29,7 +29,7 @@ For single-config generators such as Ninja, the executable is usually at:
 
 ## Transcription Backends
 
-The current app supports both the existing OpenAI backend and a local Snapdragon NPU path through the sibling `npu-stt-c` library.
+The current app supports both the existing OpenAI backend and a local Snapdragon NPU path through the `stt` library inside the sibling [NPU Voice C](../npu-voice-c) repo.
 
 At runtime, the system tray now lets you switch:
 - backend: `OpenAI` or `NPU`
@@ -50,51 +50,49 @@ TB_TRANSCRIPTION_BACKEND=npu
 TB_TRANSCRIPTION_MODEL=whisper_small_en
 # Optional: evict cached ORT/QNN sessions after 60s idle. Set 0 to keep them forever.
 # TB_NPU_CACHE_IDLE_MS=60000
-# Optional overrides if you don't want to use the sibling npu-stt-c artifact layout:
+# Optional override if your staged STT assets are not under ../npu-voice-assets/stt:
+# TB_NPU_INSTALL_ROOT=C:\path\to\npu-stt-assets
+# Optional per-file overrides if you don't want to use the install-root layout:
 # TB_NPU_RUNTIME_DIR=C:\path\to\runtime\windows-arm64
 # TB_NPU_PACKAGE_DIR=C:\path\to\models\whisper-base-en-qnn
 # TB_NPU_TOKENIZER_VOCAB_PATH=C:\path\to\models\whisper-base-assets\vocab_by_id.txt
 # TB_NPU_MEL_FILTERS_PATH=C:\path\to\models\whisper-base-assets\mel_filters_201x80_f32.bin
 ```
 
-`terminal-buddy` now consumes the sibling `../npu-stt-c` library and, by default, expects its staged artifact layout:
+`terminal-buddy` now builds against the sibling `../npu-voice-c` source tree and, by default, uses `../npu-voice-assets/stt` as the STT install-root-style artifact folder:
 
 ```text
-../npu-stt-c/runtime/windows-arm64/onnxruntime.dll
-../npu-stt-c/runtime/windows-arm64/QnnHtp.dll
-../npu-stt-c/models/whisper-base-en-qnn/HfWhisperEncoder.onnx
-../npu-stt-c/models/whisper-base-en-qnn/HfWhisperDecoder.onnx
-../npu-stt-c/models/whisper-base-assets/vocab_by_id.txt
-../npu-stt-c/models/whisper-base-assets/mel_filters_201x80_f32.bin
+../npu-voice-assets/stt/runtime/windows-arm64/onnxruntime.dll
+../npu-voice-assets/stt/runtime/windows-arm64/QnnHtp.dll
+../npu-voice-assets/stt/models/whisper-base-en-qnn/HfWhisperEncoder.onnx
+../npu-voice-assets/stt/models/whisper-base-en-qnn/HfWhisperDecoder.onnx
+../npu-voice-assets/stt/models/whisper-base-assets/vocab_by_id.txt
+../npu-voice-assets/stt/models/whisper-base-assets/mel_filters_201x80_f32.bin
 ```
 
-Default sibling model mapping:
+The STT library now owns the default model-to-package and asset mapping. `terminal-buddy` only passes the install root unless you explicitly override individual paths.
 
-- `whisper_tiny_en` -> `../npu-stt-c/models/whisper-tiny-en-qnn`
-- `whisper_base_en` -> `../npu-stt-c/models/whisper-base-en-qnn`
-- `whisper_small_en` -> `../npu-stt-c/models/whisper-small-en-qnn`
-- `whisper_large_v3_turbo` -> `../npu-stt-c/build/local-models/whisper-large-v3-turbo-root/whisper-large-v3-turbo-qnn`
+To verify the staged backend can initialize and transcribe through the ported STT library, a probe-only build is enough:
 
-`Large V3 Turbo` also expects the sibling release-asset staging path for its `128`-bin mel filters:
-
-```text
-../npu-stt-c/build/local-models/whisper-large-v3-turbo-root/whisper-large-v3-assets/vocab_by_id.txt
-../npu-stt-c/build/local-models/whisper-large-v3-turbo-root/whisper-large-v3-assets/mel_filters_201x128_f32.bin
+```powershell
+cmake -S . -B build-port-proof -G Ninja `
+  -DTERMINAL_BUDDY_BUILD_APP=OFF `
+  -DTERMINAL_BUDDY_BUILD_TEXT_ENGINE_PROBE=OFF `
+  -DTERMINAL_BUDDY_BUILD_TRANSCRIPTION_PROBE=ON
+cmake --build build-port-proof --target transcription-probe
 ```
 
-If those paths do not exist on your machine, keep using `Tiny`, `Base`, or `Small`, or set the NPU override env vars explicitly.
-
-To verify the staged backend can initialize and transcribe through `npu-stt-c`, run:
+Then run:
 
 ```powershell
 @'
 TB_TRANSCRIPTION_BACKEND=npu
 '@ | Set-Content build\probe-real-npu.env
 
-.\build\Debug\transcription-probe.exe .\build\probe-real-npu.env --audio .\build\Recording-probe.wav
+.\build-port-proof\transcription-probe.exe .\build\probe-real-npu.env --smoke --audio ..\npu-voice-c\stt\tests\golden.wav
 ```
 
-The probe prints the resolved runtime/package paths, runs a real transcription, and reports the same timing block the app shows in the UI.
+The probe prints the resolved install root, runtime/package paths, runs a real transcription, and reports the same timing block the app shows in the UI.
 
 ## Next steps
 

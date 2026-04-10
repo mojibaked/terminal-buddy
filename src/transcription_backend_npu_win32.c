@@ -6,8 +6,8 @@
 
 #include <npu_stt.h>
 
-#ifndef TERMINAL_BUDDY_NPU_STT_SOURCE_DIR
-#define TERMINAL_BUDDY_NPU_STT_SOURCE_DIR ""
+#ifndef TERMINAL_BUDDY_NPU_STT_INSTALL_ROOT
+#define TERMINAL_BUDDY_NPU_STT_INSTALL_ROOT ""
 #endif
 
 typedef struct TbNpuBackendState {
@@ -15,10 +15,15 @@ typedef struct TbNpuBackendState {
     npu_stt_session *session;
     TbTranscriptionNpuTimingStats last_timing;
     char model[TB_TRANSCRIPTION_MODEL_MAX];
+    char install_root[TB_TRANSCRIPTION_PATH_MAX];
     char runtime_dir[TB_TRANSCRIPTION_PATH_MAX];
     char package_dir[TB_TRANSCRIPTION_PATH_MAX];
     char tokenizer_vocab_path[TB_TRANSCRIPTION_PATH_MAX];
     char mel_filters_path[TB_TRANSCRIPTION_PATH_MAX];
+    char resolved_runtime_dir[TB_TRANSCRIPTION_PATH_MAX];
+    char resolved_package_dir[TB_TRANSCRIPTION_PATH_MAX];
+    char resolved_tokenizer_vocab_path[TB_TRANSCRIPTION_PATH_MAX];
+    char resolved_mel_filters_path[TB_TRANSCRIPTION_PATH_MAX];
     Uint32 idle_cache_ms;
 } TbNpuBackendState;
 
@@ -44,84 +49,6 @@ static void tb_set_status(TbTranscriptionConfig *config, const char *status, con
     va_start(args, format);
     SDL_vsnprintf(config->missing_detail, sizeof(config->missing_detail), format, args);
     va_end(args);
-}
-
-static bool tb_is_absolute_path(const char *path) {
-    if (path == NULL || path[0] == '\0') {
-        return false;
-    }
-
-    if ((path[0] == '\\' && path[1] == '\\') || (path[0] == '/' && path[1] == '/')) {
-        return true;
-    }
-
-    return SDL_strlen(path) > 2 && path[1] == ':';
-}
-
-static void tb_join_path(char *dest, size_t dest_size, const char *left, const char *right) {
-    size_t left_length = 0;
-
-    if (right == NULL || right[0] == '\0') {
-        tb_copy_text(dest, dest_size, left);
-        return;
-    }
-
-    if (left == NULL || left[0] == '\0' || tb_is_absolute_path(right)) {
-        tb_copy_text(dest, dest_size, right);
-        return;
-    }
-
-    left_length = SDL_strlen(left);
-    if (left_length > 0 && (left[left_length - 1] == '\\' || left[left_length - 1] == '/')) {
-        SDL_snprintf(dest, dest_size, "%s%s", left, right);
-    } else {
-        SDL_snprintf(dest, dest_size, "%s\\%s", left, right);
-    }
-}
-
-static const char *tb_default_package_subpath_for_model(const char *model) {
-    if (model != NULL && SDL_strcmp(model, "whisper_tiny_en") == 0) {
-        return "models\\whisper-tiny-en-qnn";
-    }
-
-    if (model != NULL && SDL_strcmp(model, "whisper_small_en") == 0) {
-        return "models\\whisper-small-en-qnn";
-    }
-
-    if (model != NULL && SDL_strcmp(model, "whisper_large_v3_turbo") == 0) {
-        return "build\\local-models\\whisper-large-v3-turbo-root\\whisper-large-v3-turbo-qnn";
-    }
-
-    return "models\\whisper-base-en-qnn";
-}
-
-static const char *tb_default_tokenizer_vocab_subpath_for_model(const char *model) {
-    if (model != NULL && SDL_strcmp(model, "whisper_large_v3_turbo") == 0) {
-        return "build\\local-models\\whisper-large-v3-turbo-root\\whisper-large-v3-assets\\vocab_by_id.txt";
-    }
-
-    return "models\\whisper-base-assets\\vocab_by_id.txt";
-}
-
-static const char *tb_default_mel_filters_subpath_for_model(const char *model) {
-    if (model != NULL && SDL_strcmp(model, "whisper_large_v3_turbo") == 0) {
-        return "build\\local-models\\whisper-large-v3-turbo-root\\whisper-large-v3-assets\\mel_filters_201x128_f32.bin";
-    }
-
-    return "models\\whisper-base-assets\\mel_filters_201x80_f32.bin";
-}
-
-static void tb_build_npu_stt_repo_default(
-    char *dest,
-    size_t dest_size,
-    const char *relative_path
-) {
-    if (TERMINAL_BUDDY_NPU_STT_SOURCE_DIR[0] == '\0') {
-        dest[0] = '\0';
-        return;
-    }
-
-    tb_join_path(dest, dest_size, TERMINAL_BUDDY_NPU_STT_SOURCE_DIR, relative_path);
 }
 
 static bool tb_npu_ensure_mutex(void) {
@@ -172,12 +99,51 @@ static double tb_npu_ticks_to_ms(Uint64 tick_delta) {
     return ((double) tick_delta * 1000.0) / (double) frequency;
 }
 
+static void tb_npu_snapshot_resolved_paths_locked(
+    const npu_stt_resolved_install_paths *paths,
+    const TbTranscriptionConfig *config
+) {
+    if (paths != NULL) {
+        tb_copy_text(g_tb_npu_state.resolved_runtime_dir, sizeof(g_tb_npu_state.resolved_runtime_dir), paths->runtime_dir);
+        tb_copy_text(g_tb_npu_state.resolved_package_dir, sizeof(g_tb_npu_state.resolved_package_dir), paths->package_dir);
+        tb_copy_text(
+            g_tb_npu_state.resolved_tokenizer_vocab_path,
+            sizeof(g_tb_npu_state.resolved_tokenizer_vocab_path),
+            paths->tokenizer_vocab_path
+        );
+        tb_copy_text(
+            g_tb_npu_state.resolved_mel_filters_path,
+            sizeof(g_tb_npu_state.resolved_mel_filters_path),
+            paths->mel_filters_path
+        );
+        return;
+    }
+
+    tb_copy_text(g_tb_npu_state.resolved_runtime_dir, sizeof(g_tb_npu_state.resolved_runtime_dir), config != NULL ? config->runtime_dir : NULL);
+    tb_copy_text(g_tb_npu_state.resolved_package_dir, sizeof(g_tb_npu_state.resolved_package_dir), config != NULL ? config->package_dir : NULL);
+    tb_copy_text(
+        g_tb_npu_state.resolved_tokenizer_vocab_path,
+        sizeof(g_tb_npu_state.resolved_tokenizer_vocab_path),
+        config != NULL ? config->tokenizer_vocab_path : NULL
+    );
+    tb_copy_text(
+        g_tb_npu_state.resolved_mel_filters_path,
+        sizeof(g_tb_npu_state.resolved_mel_filters_path),
+        config != NULL ? config->mel_filters_path : NULL
+    );
+}
+
 static void tb_npu_clear_session_snapshot_locked(void) {
     g_tb_npu_state.model[0] = '\0';
+    g_tb_npu_state.install_root[0] = '\0';
     g_tb_npu_state.runtime_dir[0] = '\0';
     g_tb_npu_state.package_dir[0] = '\0';
     g_tb_npu_state.tokenizer_vocab_path[0] = '\0';
     g_tb_npu_state.mel_filters_path[0] = '\0';
+    g_tb_npu_state.resolved_runtime_dir[0] = '\0';
+    g_tb_npu_state.resolved_package_dir[0] = '\0';
+    g_tb_npu_state.resolved_tokenizer_vocab_path[0] = '\0';
+    g_tb_npu_state.resolved_mel_filters_path[0] = '\0';
     g_tb_npu_state.idle_cache_ms = 0;
 }
 
@@ -197,6 +163,7 @@ static bool tb_npu_config_matches_session_locked(const TbTranscriptionConfig *co
     }
 
     return SDL_strcmp(g_tb_npu_state.model, config->model) == 0
+        && SDL_strcmp(g_tb_npu_state.install_root, config->install_root) == 0
         && SDL_strcmp(g_tb_npu_state.runtime_dir, config->runtime_dir) == 0
         && SDL_strcmp(g_tb_npu_state.package_dir, config->package_dir) == 0
         && SDL_strcmp(g_tb_npu_state.tokenizer_vocab_path, config->tokenizer_vocab_path) == 0
@@ -206,6 +173,7 @@ static bool tb_npu_config_matches_session_locked(const TbTranscriptionConfig *co
 
 static void tb_npu_snapshot_config_locked(const TbTranscriptionConfig *config) {
     tb_copy_text(g_tb_npu_state.model, sizeof(g_tb_npu_state.model), config->model);
+    tb_copy_text(g_tb_npu_state.install_root, sizeof(g_tb_npu_state.install_root), config->install_root);
     tb_copy_text(g_tb_npu_state.runtime_dir, sizeof(g_tb_npu_state.runtime_dir), config->runtime_dir);
     tb_copy_text(g_tb_npu_state.package_dir, sizeof(g_tb_npu_state.package_dir), config->package_dir);
     tb_copy_text(
@@ -223,9 +191,12 @@ static void tb_npu_snapshot_config_locked(const TbTranscriptionConfig *config) {
 
 static bool tb_npu_create_session_locked(const TbTranscriptionConfig *config, char **out_error) {
     npu_stt_session_config session_config;
+    npu_stt_install_layout_config install_layout;
+    npu_stt_resolved_install_paths resolved_paths;
     npu_stt_status status;
     char *internal_error = NULL;
     npu_stt_session *session = NULL;
+    bool use_install_root = false;
 
     if (out_error != NULL) {
         *out_error = NULL;
@@ -245,15 +216,29 @@ static bool tb_npu_create_session_locked(const TbTranscriptionConfig *config, ch
     tb_npu_destroy_session_locked();
 
     npu_stt_session_config_init(&session_config);
+    npu_stt_install_layout_config_init(&install_layout);
+    npu_stt_resolved_install_paths_init(&resolved_paths);
     session_config.model_id = config->model[0] != '\0' ? config->model : NULL;
     session_config.enable_warm_cache = config->npu_cache_idle_ms > 0;
     session_config.idle_cache_ms = config->npu_cache_idle_ms > 0 ? config->npu_cache_idle_ms : NPU_STT_DEFAULT_IDLE_CACHE_MS;
-    session_config.artifacts.runtime_dir = config->runtime_dir;
-    session_config.artifacts.package_dir = config->package_dir;
+    session_config.artifacts.runtime_dir = config->runtime_dir[0] != '\0' ? config->runtime_dir : NULL;
+    session_config.artifacts.package_dir = config->package_dir[0] != '\0' ? config->package_dir : NULL;
     session_config.artifacts.tokenizer_vocab_path = config->tokenizer_vocab_path[0] != '\0' ? config->tokenizer_vocab_path : NULL;
     session_config.artifacts.mel_filters_path = config->mel_filters_path[0] != '\0' ? config->mel_filters_path : NULL;
+    use_install_root = config->install_root[0] != '\0';
 
-    status = npu_stt_session_create(&session_config, &session, &internal_error);
+    if (use_install_root) {
+        install_layout.install_root = config->install_root;
+        status = npu_stt_session_create_from_install_root(
+            &session_config,
+            &install_layout,
+            &session,
+            &resolved_paths,
+            &internal_error
+        );
+    } else {
+        status = npu_stt_session_create(&session_config, &session, &internal_error);
+    }
     if (status != NPU_STT_STATUS_OK || session == NULL) {
         if (out_error != NULL) {
             if (internal_error != NULL) {
@@ -276,6 +261,7 @@ static bool tb_npu_create_session_locked(const TbTranscriptionConfig *config, ch
     npu_stt_free_string(internal_error);
     g_tb_npu_state.session = session;
     tb_npu_snapshot_config_locked(config);
+    tb_npu_snapshot_resolved_paths_locked(use_install_root ? &resolved_paths : NULL, config);
     return true;
 }
 
@@ -345,7 +331,7 @@ static bool tb_npu_prepare_audio(
         if (out_error != NULL) {
             SDL_asprintf(
                 out_error,
-                "SDL_ConvertAudioSamples failed while preparing %d Hz input for npu-stt-c: %s",
+                "SDL_ConvertAudioSamples failed while preparing %d Hz input for the local NPU STT backend: %s",
                 request->sample_rate,
                 SDL_GetError()
             );
@@ -370,6 +356,7 @@ static bool tb_npu_prepare_audio(
 
 void tb_transcription_backend_npu_configure(
     TbTranscriptionConfig *config,
+    const char *install_root_override,
     const char *runtime_dir_override,
     const char *package_dir_override,
     const char *tokenizer_vocab_override,
@@ -379,44 +366,34 @@ void tb_transcription_backend_npu_configure(
         return;
     }
 
+    if (install_root_override != NULL && install_root_override[0] != '\0') {
+        tb_copy_text(config->install_root, sizeof(config->install_root), install_root_override);
+    } else {
+        tb_copy_text(config->install_root, sizeof(config->install_root), TERMINAL_BUDDY_NPU_STT_INSTALL_ROOT);
+    }
+
     if (runtime_dir_override != NULL && runtime_dir_override[0] != '\0') {
         tb_copy_text(config->runtime_dir, sizeof(config->runtime_dir), runtime_dir_override);
     } else {
-        tb_build_npu_stt_repo_default(
-            config->runtime_dir,
-            sizeof(config->runtime_dir),
-            "runtime\\windows-arm64"
-        );
+        config->runtime_dir[0] = '\0';
     }
 
     if (package_dir_override != NULL && package_dir_override[0] != '\0') {
         tb_copy_text(config->package_dir, sizeof(config->package_dir), package_dir_override);
     } else {
-        tb_build_npu_stt_repo_default(
-            config->package_dir,
-            sizeof(config->package_dir),
-            tb_default_package_subpath_for_model(config->model)
-        );
+        config->package_dir[0] = '\0';
     }
 
     if (tokenizer_vocab_override != NULL && tokenizer_vocab_override[0] != '\0') {
         tb_copy_text(config->tokenizer_vocab_path, sizeof(config->tokenizer_vocab_path), tokenizer_vocab_override);
     } else {
-        tb_build_npu_stt_repo_default(
-            config->tokenizer_vocab_path,
-            sizeof(config->tokenizer_vocab_path),
-            tb_default_tokenizer_vocab_subpath_for_model(config->model)
-        );
+        config->tokenizer_vocab_path[0] = '\0';
     }
 
     if (mel_filters_override != NULL && mel_filters_override[0] != '\0') {
         tb_copy_text(config->mel_filters_path, sizeof(config->mel_filters_path), mel_filters_override);
     } else {
-        tb_build_npu_stt_repo_default(
-            config->mel_filters_path,
-            sizeof(config->mel_filters_path),
-            tb_default_mel_filters_subpath_for_model(config->model)
-        );
+        config->mel_filters_path[0] = '\0';
     }
 }
 
@@ -440,7 +417,7 @@ void tb_transcription_backend_npu_probe(TbTranscriptionConfig *config) {
             config,
             "NPU BACKEND NOT READY",
             "%s",
-            error_text != NULL ? error_text : "npu-stt-c could not validate the local NPU backend."
+            error_text != NULL ? error_text : "The local NPU STT backend could not be validated."
         );
         SDL_UnlockMutex(g_tb_npu_state.mutex);
         SDL_free(error_text);
@@ -452,10 +429,11 @@ void tb_transcription_backend_npu_probe(TbTranscriptionConfig *config) {
     tb_set_status(
         config,
         "NPU BACKEND READY",
-        "npu-stt-c validated %s using runtime %s and package %s.",
+        "The local NPU STT backend validated %s using install root %s, runtime %s, and package %s.",
         config->model,
-        config->runtime_dir,
-        config->package_dir
+        config->install_root[0] != '\0' ? config->install_root : "(explicit paths)",
+        g_tb_npu_state.resolved_runtime_dir,
+        g_tb_npu_state.resolved_package_dir
     );
     SDL_free(error_text);
 }
@@ -568,7 +546,7 @@ bool tb_transcription_backend_npu_smoke_test(
     if (!tb_npu_create_session_locked(config, &error_text)) {
         SDL_UnlockMutex(g_tb_npu_state.mutex);
         if (out_detail != NULL) {
-            *out_detail = error_text != NULL ? error_text : SDL_strdup("npu-stt-c session validation failed.");
+            *out_detail = error_text != NULL ? error_text : SDL_strdup("The local NPU STT session validation failed.");
         } else {
             SDL_free(error_text);
         }
@@ -579,10 +557,11 @@ bool tb_transcription_backend_npu_smoke_test(
     if (out_detail != NULL) {
         SDL_asprintf(
             out_detail,
-            "npu-stt-c validated session creation for %s using runtime %s and package %s.",
+            "The local NPU STT backend validated session creation for %s using install root %s, runtime %s, and package %s.",
             config != NULL && config->model[0] != '\0' ? config->model : "whisper_base_en",
-            config != NULL ? config->runtime_dir : "",
-            config != NULL ? config->package_dir : ""
+            config != NULL && config->install_root[0] != '\0' ? config->install_root : "(explicit paths)",
+            g_tb_npu_state.resolved_runtime_dir,
+            g_tb_npu_state.resolved_package_dir
         );
     }
     SDL_free(error_text);
@@ -640,12 +619,14 @@ void tb_transcription_backend_npu_shutdown(void) {
 
 void tb_transcription_backend_npu_configure(
     TbTranscriptionConfig *config,
+    const char *install_root_override,
     const char *runtime_dir_override,
     const char *package_dir_override,
     const char *tokenizer_vocab_override,
     const char *mel_filters_override
 ) {
     (void) config;
+    (void) install_root_override;
     (void) runtime_dir_override;
     (void) package_dir_override;
     (void) tokenizer_vocab_override;
@@ -663,7 +644,7 @@ void tb_transcription_backend_npu_probe(TbTranscriptionConfig *config) {
         config->missing_detail,
         sizeof(config->missing_detail),
         "%s",
-        "terminal-buddy was built without npu-stt-c. Set TERMINAL_BUDDY_NPU_STT_SOURCE_DIR to a local npu-stt-c checkout and rebuild."
+        "terminal-buddy was built without the NPU Voice C STT library. Set TERMINAL_BUDDY_NPU_VOICE_SOURCE_DIR to a local npu-voice-c checkout and rebuild."
     );
 }
 
@@ -679,7 +660,7 @@ bool tb_transcription_backend_npu_execute(
 
     if (out_error != NULL) {
         *out_error = SDL_strdup(
-            "The NPU backend is unavailable because terminal-buddy was built without npu-stt-c."
+            "The NPU backend is unavailable because terminal-buddy was built without the NPU Voice C STT library."
         );
     }
     return false;
@@ -693,7 +674,7 @@ bool tb_transcription_backend_npu_smoke_test(
 
     if (out_detail != NULL) {
         *out_detail = SDL_strdup(
-            "The NPU backend is unavailable because terminal-buddy was built without npu-stt-c."
+            "The NPU backend is unavailable because terminal-buddy was built without the NPU Voice C STT library."
         );
     }
     return false;
